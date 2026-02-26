@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -190,6 +191,28 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			// Valid
 		default:
 			return fmt.Errorf("invalid --merge value %q: must be direct, mr, or local", slingMerge)
+		}
+	}
+
+	// Apply rig config default_merge_strategy when --merge flag is not set.
+	// Try to identify the target rig from args (last arg) to load its settings.
+	if slingMerge == "" && len(args) > 0 {
+		candidateRig := args[len(args)-1]
+		if rigName, isRig := IsRigName(candidateRig); isRig {
+			townRootForConfig, twErr := workspace.FindFromCwd()
+			if twErr == nil {
+				settingsPath := filepath.Join(townRootForConfig, rigName, "settings", "config.json")
+				settings, loadErr := config.LoadRigSettings(settingsPath)
+				if loadErr == nil && settings != nil && settings.MergeQueue != nil && settings.MergeQueue.DefaultMergeStrategy != "" {
+					switch settings.MergeQueue.DefaultMergeStrategy {
+					case "direct", "mr", "local":
+						slingMerge = settings.MergeQueue.DefaultMergeStrategy
+					default:
+						return fmt.Errorf("invalid default_merge_strategy %q in %s: must be direct, mr, or local",
+							settings.MergeQueue.DefaultMergeStrategy, settingsPath)
+					}
+				}
+			}
 		}
 	}
 

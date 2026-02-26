@@ -889,6 +889,10 @@ type MergeQueueConfig struct {
 	// StaleClaimTimeout is how long a claimed MR can go without updates before
 	// being considered abandoned and eligible for re-claim (e.g., "30m").
 	StaleClaimTimeout string `json:"stale_claim_timeout,omitempty"`
+
+	// DefaultMergeStrategy is the default merge strategy for sling commands
+	// when --merge is not specified. Valid values: "direct", "mr", "local".
+	DefaultMergeStrategy string `json:"default_merge_strategy,omitempty"`
 }
 
 // OnConflict strategy constants.
