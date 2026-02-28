@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -85,14 +86,22 @@ func EnsureGitignorePatterns(worktreePath string) error {
 		existingContent = string(data)
 	}
 
-	// Find missing patterns
+	// Also read the global gitignore (core.excludesfile)
+	globalContent := readGlobalGitignoreFn()
+
+	// Find missing patterns (check both local and global)
 	var missing []string
 	for _, pattern := range requiredPatterns {
 		found := false
-		for _, line := range strings.Split(existingContent, "\n") {
-			line = strings.TrimSpace(line)
-			if matchesGitignorePattern(line, pattern) {
-				found = true
+		for _, content := range []string{existingContent, globalContent} {
+			for _, line := range strings.Split(content, "\n") {
+				line = strings.TrimSpace(line)
+				if matchesGitignorePattern(line, pattern) {
+					found = true
+					break
+				}
+			}
+			if found {
 				break
 			}
 		}
@@ -160,6 +169,34 @@ func matchesGitignorePattern(line, pattern string) bool {
 	}
 
 	return false
+}
+
+// readGlobalGitignoreFn is the function used to read the global gitignore.
+// It can be overridden in tests to control behavior.
+var readGlobalGitignoreFn = readGlobalGitignore
+
+// readGlobalGitignore returns the contents of the global gitignore file
+// (configured via git's core.excludesfile). Returns empty string on any error.
+func readGlobalGitignore() string {
+	out, err := exec.Command("git", "config", "--global", "core.excludesfile").Output()
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return ""
+	}
+	// Expand ~ to home directory
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // copyFilePreserveMode copies a file from src to dst, preserving the source file's permissions.
