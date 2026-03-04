@@ -200,6 +200,10 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 			// A redirect file is a valid beads configuration (tracked beads case).
 			// initBeads creates this to point to mayor/rig/.beads.
 			rigHasDB = true
+		} else if _, err := os.Stat(filepath.Join(rigBeadsPath, "metadata.json")); err == nil {
+			// metadata.json indicates a Dolt server-mode database connection.
+			// The DB lives on the Dolt server, not in a local dolt/ directory.
+			rigHasDB = true
 		}
 	}
 
