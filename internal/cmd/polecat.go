@@ -439,6 +439,19 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output
+	// Reconcile state with tmux session liveness before any output.
+	// Per gt-zecmc design: tmux is ground truth for observable states.
+	// If session is dead but beads says working, the polecat is actually done.
+	// If session is running but beads says done, the polecat is still alive.
+	for i := range allPolecats {
+		p := &allPolecats[i]
+		if p.SessionRunning && p.State == polecat.StateDone {
+			p.State = polecat.StateWorking
+		} else if !p.SessionRunning && !p.Zombie && p.State == polecat.StateWorking {
+			p.State = polecat.StateDone
+		}
+	}
+
 	if polecatListJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -458,20 +471,9 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			sessionStatus = style.Success.Render("●")
 		}
 
-		// Display actual state, reconciled with tmux session liveness.
-		// Per gt-zecmc design: tmux is ground truth for observable states.
-		// If session is running but beads says done, the polecat is still alive.
-		// If session is dead but beads says working, the polecat is actually done.
-		displayState := p.State
-		if p.SessionRunning && displayState == polecat.StateDone {
-			displayState = polecat.StateWorking
-		} else if !p.SessionRunning && !p.Zombie && displayState == polecat.StateWorking {
-			displayState = polecat.StateDone
-		}
-
-		// State color
-		stateStr := string(displayState)
-		switch displayState {
+		// State color (already reconciled with tmux liveness above)
+		stateStr := string(p.State)
+		switch p.State {
 		case polecat.StateWorking:
 			stateStr = style.Info.Render(stateStr)
 		case polecat.StateStuck:
