@@ -1554,11 +1554,9 @@ func (m *Manager) SetState(name string, state State) error {
 
 	switch state {
 	case StateWorking:
-		// Set issue to in_progress if there is one.
-		// Skip if status is "hooked" — sling sets this, and changing it here causes
-		// merge conflicts when gt done runs. The polecat should claim work via gt prime,
-		// not have sling change status during spawn (gt-zecmc).
-		if issue != nil && issue.Status != "hooked" {
+		// Set issue to in_progress when polecat starts working.
+		// This transitions hooked → in_progress at spawn time.
+		if issue != nil {
 			status := "in_progress"
 			if err := m.beads.Update(issue.ID, beads.UpdateOptions{Status: &status}); err != nil {
 				return fmt.Errorf("setting issue status: %w", err)
