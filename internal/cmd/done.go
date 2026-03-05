@@ -527,6 +527,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+
+			// Fetch + rebase onto latest target before pushing to avoid
+			// non-fast-forward rejections when another polecat merged first.
+			if fetchErr := g.FetchBranch("origin", defaultBranch); fetchErr != nil {
+				style.PrintWarning("fetch origin/%s failed: %v (pushing anyway)", defaultBranch, fetchErr)
+			} else if rebaseErr := g.Rebase("origin/" + defaultBranch); rebaseErr != nil {
+				style.PrintWarning("rebase onto origin/%s failed: %v (pushing anyway)", defaultBranch, rebaseErr)
+				_ = g.AbortRebase()
+			}
+
 			directRefspec := branch + ":" + defaultBranch
 			directPushErr := g.Push("origin", directRefspec, false)
 			if directPushErr != nil {
@@ -716,6 +726,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+
+			// Fetch + rebase onto latest target before pushing to avoid
+			// non-fast-forward rejections when another polecat merged first.
+			if fetchErr := g.FetchBranch("origin", defaultBranch); fetchErr != nil {
+				style.PrintWarning("fetch origin/%s failed: %v (pushing anyway)", defaultBranch, fetchErr)
+			} else if rebaseErr := g.Rebase("origin/" + defaultBranch); rebaseErr != nil {
+				style.PrintWarning("rebase onto origin/%s failed: %v (pushing anyway)", defaultBranch, rebaseErr)
+				_ = g.AbortRebase()
+			}
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
 			directRefspec := branch + ":" + defaultBranch
