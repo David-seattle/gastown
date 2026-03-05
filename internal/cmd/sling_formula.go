@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,22 +48,17 @@ func trimJSONForError(jsonOutput []byte) string {
 	return s
 }
 
-// verifyFormulaExists checks that the formula exists using bd formula show.
-// Formulas are TOML files (.formula.toml).
-// Uses --allow-stale for consistency with verifyBeadExists.
+// verifyFormulaExists checks that the formula exists by searching the formula
+// file paths directly (project, town root, user home). This replaces the
+// previous bd formula show approach which missed the town-root search path.
 func verifyFormulaExists(formulaName string) error {
-	// Try bd formula show (handles all formula file formats)
-	// Use Output() instead of Run() to detect bd exit 0 bug:
-	// when formula not found, bd may exit 0 but produce empty stdout.
-	// Stderr discarded — first attempt may fail expectedly (retry with mol- prefix).
-	if out, err := BdCmd("formula", "show", formulaName, "--allow-stale").
-		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
+	// Try direct file lookup (searches project, town root, and user home)
+	if _, err := findFormulaFile(formulaName); err == nil {
 		return nil
 	}
 
 	// Try with mol- prefix
-	if out, err := BdCmd("formula", "show", "mol-"+formulaName, "--allow-stale").
-		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
+	if _, err := findFormulaFile("mol-" + formulaName); err == nil {
 		return nil
 	}
 
