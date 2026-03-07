@@ -33,7 +33,11 @@ func checkWorkspaceRequirements(beadID string) error {
 		}
 	}
 
-	return fmt.Errorf("bead %s is missing workspace requirements (acceptance-criteria)\n"+
-		"Create with: ws new %s r acceptance-criteria\n"+
-		"Use --force to override", beadID, beadID)
+	return fmt.Errorf("bead %s has no acceptance-criteria in the workspace\n"+
+		"Every bead needs acceptance-criteria before it can be slung.\n"+
+		"  1. Create the doc:   ws new %s r acceptance-criteria\n"+
+		"  2. Fill it in:       ws show %s acceptance-criteria\n"+
+		"                       ws edit %s acceptance-criteria --old \"...\" --new \"...\"\n"+
+		"  3. Then sling again: gt sling %s <rig>\n"+
+		"Or use --force to skip this check", beadID, beadID, beadID, beadID, beadID)
 }
