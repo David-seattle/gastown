@@ -565,10 +565,9 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Guard against slinging beads without workspace requirements.
 	// At minimum, acceptance-criteria must exist before dispatch.
-	if !slingForce {
-		if err := checkWorkspaceRequirements(beadID); err != nil {
-			return err
-		}
+	// Not bypassed by --force — requirements are non-negotiable.
+	if err := checkWorkspaceRequirements(beadID); err != nil {
+		return err
 	}
 
 	originalStatus := info.Status

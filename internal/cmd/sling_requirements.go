@@ -38,6 +38,5 @@ func checkWorkspaceRequirements(beadID string) error {
 		"  1. Create the doc:   ws new %s r acceptance-criteria\n"+
 		"  2. Fill it in:       ws show %s acceptance-criteria\n"+
 		"                       ws edit %s acceptance-criteria --old \"...\" --new \"...\"\n"+
-		"  3. Then sling again: gt sling %s <rig>\n"+
-		"Or use --force to skip this check", beadID, beadID, beadID, beadID, beadID)
+		"  3. Then sling again: gt sling %s <rig>", beadID, beadID, beadID, beadID, beadID)
 }

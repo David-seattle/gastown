@@ -147,11 +147,10 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// Guard against slinging beads without workspace requirements.
-	if !explicitForce {
-		if err := checkWorkspaceRequirements(params.BeadID); err != nil {
-			result.ErrMsg = "missing requirements"
-			return result, err
-		}
+	// Not bypassed by --force — requirements are non-negotiable.
+	if err := checkWorkspaceRequirements(params.BeadID); err != nil {
+		result.ErrMsg = "missing requirements"
+		return result, err
 	}
 
 	// Send LIFECYCLE:Shutdown to the witness when force-stealing a bead from a
