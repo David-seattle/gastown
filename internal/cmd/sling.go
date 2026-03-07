@@ -563,6 +563,14 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
 	}
 
+	// Guard against slinging beads without workspace requirements.
+	// At minimum, acceptance-criteria must exist before dispatch.
+	if !slingForce {
+		if err := checkWorkspaceRequirements(beadID); err != nil {
+			return err
+		}
+	}
+
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
 	force := slingForce // local copy to avoid mutating package-level flag

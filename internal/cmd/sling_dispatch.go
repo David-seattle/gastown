@@ -146,6 +146,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
 	}
 
+	// Guard against slinging beads without workspace requirements.
+	if !explicitForce {
+		if err := checkWorkspaceRequirements(params.BeadID); err != nil {
+			result.ErrMsg = "missing requirements"
+			return result, err
+		}
+	}
+
 	// Send LIFECYCLE:Shutdown to the witness when force-stealing a bead from a
 	// live polecat. Without this, the old polecat becomes a zombie — still running
 	// but unaware it lost its hook. Mirrors the same logic in runSling (sling.go).
