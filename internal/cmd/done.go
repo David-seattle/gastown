@@ -395,6 +395,35 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
 		}
 
+		// Verify all molecule steps are complete before allowing gt done.
+		// Polecats must complete every formula step — skipping steps is not allowed.
+		if issueID != "" {
+			bd := beads.New(beads.ResolveBeadsDir(cwd))
+			if issue, err := bd.Show(issueID); err == nil {
+				isComplete, hasMolecule := checkPinnedBeadComplete(bd, issue)
+				if hasMolecule && !isComplete {
+					// Get progress details for a helpful error message
+					attachment := beads.ParseAttachmentFields(issue)
+					if attachment != nil && attachment.AttachedMolecule != "" {
+						if progress, progressErr := getMoleculeProgressInfo(bd, attachment.AttachedMolecule); progressErr == nil && progress != nil {
+							incompleteCount := progress.TotalSteps - progress.DoneSteps
+							var incomplete []string
+							incomplete = append(incomplete, progress.ReadySteps...)
+							incomplete = append(incomplete, progress.BlockedSteps...)
+							return fmt.Errorf("cannot complete: %d/%d molecule steps incomplete\n"+
+								"Incomplete steps: %v\n"+
+								"Complete all formula steps before running gt done.\n"+
+								"Use --status ESCALATED if blocked, or --status DEFERRED to pause.",
+								incompleteCount, progress.TotalSteps, incomplete)
+						}
+					}
+					return fmt.Errorf("cannot complete: molecule steps are incomplete\n" +
+						"Complete all formula steps before running gt done.\n" +
+						"Use --status ESCALATED if blocked, or --status DEFERRED to pause.")
+				}
+			}
+		}
+
 		// CRITICAL: Verify work exists before completing (hq-xthqf)
 		// Polecats calling gt done without commits results in lost work.
 		// We MUST check for:
