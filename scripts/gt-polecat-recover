@@ -1,0 +1,294 @@
+#!/bin/bash
+# gt-polecat-recover - Find beads stuck in 'hooked' status on dead agents, unhook them
+#
+# Replaces the deacon's ScanStaleHooks function.
+# Default: report-only. Use --fix to unhook stale beads back to 'open'.
+# Use --resling with --fix to re-sling beads that were on dead polecats.
+
+set -euo pipefail
+
+FIX=false
+RESLING=false
+MAX_RECOVERIES=5
+RECOVERY_COUNTS_FILE="${RECOVERY_COUNTS_FILE:-$HOME/.cache/gt/recovery-counts}"
+mkdir -p "$(dirname "$RECOVERY_COUNTS_FILE")"
+
+for arg in "$@"; do
+    case "$arg" in
+        --fix) FIX=true ;;
+        --resling) RESLING=true ;;
+    esac
+done
+
+# Recovery counter helpers — persistent file tracks per-bead recovery attempts
+get_recovery_count() {
+    local bead_id="$1"
+    grep "^${bead_id} " "$RECOVERY_COUNTS_FILE" 2>/dev/null | awk '{print $2}' || echo 0
+}
+
+increment_recovery_count() {
+    local bead_id="$1"
+    local current
+    current=$(get_recovery_count "$bead_id")
+    local next=$((current + 1))
+    # Atomic update: remove old line, append new
+    if [[ -f "$RECOVERY_COUNTS_FILE" ]]; then
+        grep -v "^${bead_id} " "$RECOVERY_COUNTS_FILE" > "${RECOVERY_COUNTS_FILE}.tmp" 2>/dev/null || true
+        mv "${RECOVERY_COUNTS_FILE}.tmp" "$RECOVERY_COUNTS_FILE"
+    fi
+    echo "${bead_id} ${next}" >> "$RECOVERY_COUNTS_FILE"
+    echo "$next"
+}
+
+clear_recovery_count() {
+    local bead_id="$1"
+    if [[ -f "$RECOVERY_COUNTS_FILE" ]]; then
+        grep -v "^${bead_id} " "$RECOVERY_COUNTS_FILE" > "${RECOVERY_COUNTS_FILE}.tmp" 2>/dev/null || true
+        mv "${RECOVERY_COUNTS_FILE}.tmp" "$RECOVERY_COUNTS_FILE"
+    fi
+}
+
+# Permanently-off agents — always stale if hooked
+DEAD_AGENTS="deacon|boot"
+DEAD_SUFFIXES="/witness|/refinery"
+
+# Fetch hooked and in_progress beads across ALL rigs (not just HQ).
+# bd list without --rig only searches the current rig's database.
+GT=/Users/davidtarico/gt
+RIGS=$(cat "$GT/.beads/routes.jsonl" 2>/dev/null | jq -r '.path' | sort -u)
+ALL_BEADS="[]"
+for rig_path in $RIGS; do
+    rig_dir=$(echo "$rig_path" | cut -d/ -f1)
+    [[ "$rig_dir" == "." ]] && rig_dir=""
+    for _status in hooked in_progress open; do
+        if [[ -n "$rig_dir" ]]; then
+            _BEADS=$(cd "$GT" && bd list --status="$_status" --rig "$rig_dir" --json --limit=0 2>/dev/null || echo "[]")
+        else
+            _BEADS=$(cd "$GT" && bd list --status="$_status" --json --limit=0 2>/dev/null || echo "[]")
+        fi
+        ALL_BEADS=$(echo "$ALL_BEADS" "$_BEADS" | jq -s 'add // [] | unique_by(.id)')
+    done
+done
+HOOKED="$ALL_BEADS"
+
+# Normalize empty/null to empty array for consistent jq processing
+if [[ -z "$HOOKED" ]] || [[ "$HOOKED" == "null" ]]; then
+    HOOKED="[]"
+fi
+
+# Fetch live polecats
+POLECATS=$(cd /Users/davidtarico/gt && gt polecat list --all --json 2>/dev/null || echo "[]")
+
+STALE_COUNT=0
+UNKNOWN_COUNT=0
+STALE_IDS=()
+RESLING_IDS=()
+RESLING_RIGS=()  # parallel array: rig_name for each RESLING_IDS entry
+
+while IFS= read -r bead; do
+    ID=$(echo "$bead" | jq -r '.id')
+    ASSIGNEE=$(echo "$bead" | jq -r '.assignee // "unassigned"')
+    TITLE=$(echo "$bead" | jq -r '.title')
+    TYPE=$(echo "$bead" | jq -r '.issue_type // "unknown"')
+    EPHEMERAL=$(echo "$bead" | jq -r '.ephemeral // false')
+    CREATED=$(echo "$bead" | jq -r '.created_at')
+
+    # Calculate age
+    if command -v gdate &>/dev/null; then
+        CREATED_TS=$(gdate -d "$CREATED" +%s 2>/dev/null || echo 0)
+        NOW_TS=$(gdate +%s)
+    else
+        CREATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CREATED" +%s 2>/dev/null || echo 0)
+        NOW_TS=$(date +%s)
+    fi
+    if [[ "$CREATED_TS" -gt 0 ]]; then
+        AGE_HOURS=$(( (NOW_TS - CREATED_TS) / 3600 ))
+        AGE="${AGE_HOURS}h"
+    else
+        AGE="unknown"
+    fi
+
+    STALE=false
+    REASON=""
+    IS_POLECAT=false
+
+    # Check permanently-off agents
+    if echo "$ASSIGNEE" | grep -qE "^(${DEAD_AGENTS})$"; then
+        STALE=true
+        REASON="dead agent"
+    elif echo "$ASSIGNEE" | grep -qE "(${DEAD_SUFFIXES})$"; then
+        STALE=true
+        REASON="dead agent"
+    # Check polecat assignees
+    elif echo "$ASSIGNEE" | grep -q "/polecats/"; then
+        IS_POLECAT=true
+        PC_RIG=$(echo "$ASSIGNEE" | cut -d/ -f1)
+        PC_NAME=$(echo "$ASSIGNEE" | cut -d/ -f3)
+
+        SESSION_RUNNING=$(echo "$POLECATS" | jq -r --arg rig "$PC_RIG" --arg name "$PC_NAME" \
+            '.[] | select(.rig==$rig and .name==$name) | .session_running' 2>/dev/null)
+
+        if [[ -z "$SESSION_RUNNING" ]]; then
+            STALE=true
+            REASON="polecat not found"
+        elif [[ "$SESSION_RUNNING" == "false" ]]; then
+            STALE=true
+            REASON="session dead"
+        elif [[ "$SESSION_RUNNING" == "true" ]]; then
+            # Session is alive — check if Claude Code is stuck at an interactive prompt
+            # that a polecat can't answer (rate limit, confirmation dialog, etc.)
+            TMUX_SESSION="sa-${PC_NAME}"
+            PANE_OUTPUT=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null || true)
+            if echo "$PANE_OUTPUT" | tail -10 | grep -qE "out of.*usage|rate.limit|Enter to confirm.*Esc to cancel"; then
+                STALE=true
+                REASON="stuck at interactive prompt"
+            fi
+        fi
+    else
+        UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1))
+        echo "  ? $ID  assignee=$ASSIGNEE  (unknown agent type, skipping)"
+        continue
+    fi
+
+    if [[ "$STALE" == "true" ]]; then
+        STALE_COUNT=$((STALE_COUNT + 1))
+        STALE_IDS+=("$ID")
+        echo "  STALE  $ID  assignee=$ASSIGNEE  age=$AGE  reason=$REASON"
+        echo "         $TITLE"
+
+        # Mark for re-sling: polecat work, non-ephemeral, task/bug/feature type
+        if [[ "$IS_POLECAT" == "true" ]] && [[ "$EPHEMERAL" != "true" ]]; then
+            case "$TYPE" in
+                task|bug|feature) RESLING_IDS+=("$ID"); RESLING_RIGS+=("$PC_RIG") ;;
+            esac
+        fi
+    fi
+done < <(echo "$HOOKED" | jq -c '.[]')
+
+# Detect orphaned polecats: alive (session_running=true) but no bead assigned to them.
+# This catches polecats that were superseded by re-dispatch but never cleaned up.
+ORPHAN_COUNT=0
+while IFS= read -r polecat; do
+    PC_RIG=$(echo "$polecat" | jq -r '.rig')
+    PC_NAME=$(echo "$polecat" | jq -r '.name')
+    PC_STATE=$(echo "$polecat" | jq -r '.state')
+    PC_SESSION=$(echo "$polecat" | jq -r '.session_running')
+    PC_ISSUE=$(echo "$polecat" | jq -r '.issue // ""')
+
+    [[ "$PC_SESSION" != "true" ]] && continue
+
+    EXPECTED_ASSIGNEE="${PC_RIG}/polecats/${PC_NAME}"
+    ASSIGNED=$(echo "$HOOKED" | jq -r --arg a "$EXPECTED_ASSIGNEE" \
+        '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
+
+    if [[ "$ASSIGNED" == "0" ]]; then
+        ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
+        echo "  ORPHAN  ${PC_RIG}/${PC_NAME}  issue=${PC_ISSUE}  state=${PC_STATE}  (no bead assigned)"
+    fi
+done < <(echo "$POLECATS" | jq -c '.[]')
+
+echo ""
+
+if [[ $STALE_COUNT -eq 0 ]] && [[ $ORPHAN_COUNT -eq 0 ]]; then
+    echo "No hooked/in-progress beads found."
+    [[ $UNKNOWN_COUNT -gt 0 ]] && echo "($UNKNOWN_COUNT unknown assignees skipped)"
+    exit 0
+fi
+
+echo "Found $STALE_COUNT stale hooked bead(s)."
+[[ $UNKNOWN_COUNT -gt 0 ]] && echo "($UNKNOWN_COUNT unknown assignees skipped)"
+
+if [[ "$FIX" == "true" ]]; then
+    ERRORS=0
+
+    # Unhook stale beads
+    if [[ $STALE_COUNT -gt 0 ]]; then
+    echo ""
+    echo "Unhooking stale beads..."
+    for ID in "${STALE_IDS[@]}"; do
+        if cd /Users/davidtarico/gt && bd update "$ID" --status=open --assignee "" 2>/dev/null; then
+            echo "  OK  $ID → open"
+        else
+            echo "  FAIL  $ID"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done
+
+    # Re-sling polecat work if requested
+    if [[ "$RESLING" == "true" ]] && [[ ${#RESLING_IDS[@]} -gt 0 ]]; then
+        echo ""
+        echo "Re-slinging ${#RESLING_IDS[@]} polecat bead(s)..."
+        for i in "${!RESLING_IDS[@]}"; do
+            ID="${RESLING_IDS[$i]}"
+            SLING_RIG="${RESLING_RIGS[$i]:-}"
+            # Check if MR beads already exist — gt done succeeded but selfKillSession
+            # killed the tmux session, making the polecat look dead. The work was
+            # already submitted; the refinery will process the merge.
+            MR_EXISTS=$(echo "$ALL_BEADS" | jq -r --arg id "$ID" \
+                '.[] | select(.title == "Merge: " + $id) | .id' 2>/dev/null | head -1)
+            if [[ -n "$MR_EXISTS" ]]; then
+                echo "  SKIP-MR  $ID  (MR bead $MR_EXISTS exists — work already submitted via gt done)"
+                clear_recovery_count "$ID"
+                continue
+            fi
+
+            # Check recovery limit before re-slinging
+            RC_COUNT=$(get_recovery_count "$ID")
+            if [[ $RC_COUNT -ge $MAX_RECOVERIES ]]; then
+                echo "  QUARANTINE  $ID  (recovered $RC_COUNT times, limit=$MAX_RECOVERIES)"
+                cd /Users/davidtarico/gt && gt mail send mayor/ \
+                    -s "QUARANTINE: $ID stuck in recovery loop" \
+                    -m "Bead $ID has been recovered $RC_COUNT times (limit: $MAX_RECOVERIES). Likely stuck in a crash loop (context exhaustion, bad task, etc.). Bead left as OPEN but not re-slung. Investigate and either fix the root cause or close the bead." \
+                    --priority 1 2>/dev/null || echo "  WARNING: failed to send quarantine mail"
+                continue
+            fi
+
+            NEXT_COUNT=$(increment_recovery_count "$ID")
+            if [[ -z "$SLING_RIG" ]]; then
+                echo "  SLING-SKIP  $ID  (no rig found in assignee)"
+                ERRORS=$((ERRORS + 1))
+                continue
+            fi
+            if cd /Users/davidtarico/gt && gt sling "$ID" "$SLING_RIG" --force --no-boot 2>/dev/null; then
+                echo "  SLUNG  $ID  (recovery $NEXT_COUNT/$MAX_RECOVERIES)"
+            else
+                echo "  SLING-FAIL  $ID"
+                ERRORS=$((ERRORS + 1))
+            fi
+        done
+    elif [[ "$RESLING" == "false" ]] && [[ ${#RESLING_IDS[@]} -gt 0 ]]; then
+        echo ""
+        echo "${#RESLING_IDS[@]} bead(s) eligible for re-sling. Use --resling to auto-dispatch."
+    fi
+    fi  # end if STALE_COUNT > 0
+
+    # Nuke orphaned polecats
+    if [[ $ORPHAN_COUNT -gt 0 ]]; then
+        echo ""
+        echo "Nuking $ORPHAN_COUNT orphaned polecat(s)..."
+        while IFS= read -r polecat; do
+            PC_RIG=$(echo "$polecat" | jq -r '.rig')
+            PC_NAME=$(echo "$polecat" | jq -r '.name')
+            PC_SESSION=$(echo "$polecat" | jq -r '.session_running')
+            [[ "$PC_SESSION" != "true" ]] && continue
+            EXPECTED_ASSIGNEE="${PC_RIG}/polecats/${PC_NAME}"
+            ASSIGNED=$(echo "$HOOKED" | jq -r --arg a "$EXPECTED_ASSIGNEE" \
+                '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
+            if [[ "$ASSIGNED" == "0" ]]; then
+                if cd /Users/davidtarico/gt && gt polecat nuke "${PC_RIG}/${PC_NAME}" --force 2>/dev/null; then
+                    echo "  NUKED  ${PC_RIG}/${PC_NAME}"
+                else
+                    echo "  NUKE-FAIL  ${PC_RIG}/${PC_NAME}"
+                    ERRORS=$((ERRORS + 1))
+                fi
+            fi
+        done < <(echo "$POLECATS" | jq -c '.[]')
+    fi
+
+    echo ""
+    echo "Done. Unhook: $((STALE_COUNT - ERRORS)) succeeded, $ERRORS failed."
+    [[ $ERRORS -gt 0 ]] && exit 1
+else
+    echo ""
+    echo "Run with --fix to unhook these beads."
+fi

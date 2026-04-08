@@ -1,0 +1,445 @@
+#!/bin/bash
+# gt-refinery-drain - On-demand merge queue processor
+#
+# Processes MR beads created by `gt done` with zero AI cost for clean merges.
+# Conflicts are delegated to polecats via mol-polecat-conflict-resolve formula.
+#
+# Run by gt-patrol as a step, or manually for testing.
+# Set DRY_RUN=1 to preview without executing.
+
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+GT=/Users/davidtarico/gt
+LOCK_DIR="$GT/.drain-locks"
+DRY_RUN="${DRY_RUN:-0}"
+
+# Track held lock for cleanup trap
+HELD_LOCK=""
+
+log() { echo "  [drain] $*"; }
+
+# Close a bead with error logging (never suppress errors silently)
+drain_close() {
+    local bead_id="$1" reason="$2"
+    local err_file
+    err_file=$(mktemp)
+    if bd close "$bead_id" -r "$reason" 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+    fi
+    local close_err
+    close_err=$(cat "$err_file" 2>/dev/null)
+    rm -f "$err_file"
+    log "WARNING: bd close $bead_id failed: $close_err (retrying...)"
+    sleep 1
+    if bd close "$bead_id" -r "$reason" 2>/dev/null; then
+        return 0
+    fi
+    log "ERROR: bd close $bead_id failed after retry"
+    return 1
+}
+
+# Close ALL open MR beads that reference the same branch.
+# Prevents duplicate MR beads from keeping the loop alive.
+close_all_mrs_for_branch() {
+    local branch="$1" reason="$2" refinery_dir="$3"
+    cd "$refinery_dir"
+    local mrs
+    mrs=$(bd list --label-any gt:merge-request --status open --json --limit 0 2>/dev/null || echo "[]")
+    [[ "$mrs" == "[]" ]] && return 0
+
+    while IFS= read -r bid; do
+        [[ -z "$bid" ]] && continue
+        local desc bead_branch
+        desc=$(bd show "$bid" --json 2>/dev/null | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
+        bead_branch=$(echo "$desc" | { grep "^branch:" || true; } | head -1 | sed 's/^branch: *//')
+        if [[ "$bead_branch" == "$branch" ]]; then
+            drain_close "$bid" "$reason" || true
+            local src
+            src=$(echo "$desc" | { grep "^source_issue:" || true; } | head -1 | sed 's/^source_issue: *//')
+            if [[ -n "$src" ]]; then
+                drain_close "$src" "$reason" || true
+            fi
+        fi
+    done < <(echo "$mrs" | jq -r '.[].id')
+}
+
+# Fall back to GitHub PR when direct push is blocked by branch protection.
+# Pushes the rebased branch, creates a PR, and enables auto-merge.
+# If a PR already exists for this branch (open OR closed), skips creation.
+merge_via_pr() {
+    local mr_id="$1" branch="$2" target="$3" source_issue="$4" refinery_dir="$5"
+
+    # Check for existing PR from this branch (any state: open, closed, merged).
+    # This prevents the re-creation loop when someone closes a drain-created PR.
+    local any_prs
+    any_prs=$(gh pr list --head "$branch" --base "$target" --state all \
+        --json number,state --limit 1 2>/dev/null || echo "[]")
+
+    local pr_num pr_state
+    pr_num=$(echo "$any_prs" | jq -r '.[0].number // empty' 2>/dev/null || true)
+    pr_state=$(echo "$any_prs" | jq -r '.[0].state // empty' 2>/dev/null || true)
+
+    if [[ -n "$pr_num" ]]; then
+        if [[ "$pr_state" == "OPEN" ]]; then
+            log "$mr_id: PR #$pr_num already open, waiting for merge"
+        else
+            log "$mr_id: PR #$pr_num exists ($pr_state), closing MR beads"
+            cd "$refinery_dir"
+            close_all_mrs_for_branch "$branch" "PR #$pr_num $pr_state" "$refinery_dir"
+        fi
+        return 0
+    fi
+
+    # Push rebased commits to the polecat branch on remote
+    if ! git push origin "temp-merge:$branch" --force 2>/dev/null; then
+        log "$mr_id: could not push rebased branch, leaving open for retry"
+        return 0
+    fi
+
+    # Create PR
+    local pr_url
+    pr_url=$(gh pr create \
+        --base "$target" \
+        --head "$branch" \
+        --title "Merge: ${source_issue:-$mr_id}" \
+        --body "Automated merge via refinery drain.
+Source: $source_issue
+MR bead: $mr_id" \
+        2>/dev/null || true)
+
+    if [[ -n "$pr_url" ]]; then
+        log "$mr_id: created PR ($pr_url), enabling auto-merge"
+        gh pr merge "$branch" --auto --rebase 2>/dev/null || log "$mr_id: auto-merge setup failed"
+        # Close ALL MR beads for this branch — not just the current one.
+        # Duplicate MR beads (from gt done race conditions) would otherwise
+        # keep the loop alive even after closing the triggering bead.
+        cd "$refinery_dir"
+        close_all_mrs_for_branch "$branch" "PR created: $pr_url" "$refinery_dir"
+    else
+        log "$mr_id: PR creation failed, leaving open for retry"
+    fi
+}
+
+cleanup_lock() {
+    if [[ -n "$HELD_LOCK" ]]; then
+        rm -f "$HELD_LOCK"
+        HELD_LOCK=""
+    fi
+}
+trap cleanup_lock EXIT
+
+# Parse key-value field from MR description
+parse_mr_field() {
+    local desc="$1" field="$2"
+    echo "$desc" | { grep "^${field}:" || true; } | head -1 | sed "s/^${field}: *//"
+}
+
+# Discover rigs from routes, excluding HQ
+discover_rigs() {
+    jq -r 'select(.prefix | test("^hq-") | not) | .path' "$GT/.beads/routes.jsonl" |
+        cut -d/ -f1 | sort -u
+}
+
+# Acquire file-based lock for a rig. Returns 0 on success.
+# Uses mkdir for atomicity. Lock file contains PID for stale detection.
+acquire_lock() {
+    local rig="$1"
+    mkdir -p "$LOCK_DIR"
+    local lockfile="$LOCK_DIR/$rig.lock"
+
+    # Check for stale lock (process no longer running)
+    if [[ -f "$lockfile" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$lockfile" 2>/dev/null || true)
+        if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            log "$rig: removing stale lock (pid $lock_pid)"
+            rm -f "$lockfile"
+        else
+            log "$rig: lock held (pid $lock_pid), skipping"
+            return 1
+        fi
+    fi
+
+    echo $$ > "$lockfile"
+    HELD_LOCK="$lockfile"
+    return 0
+}
+
+release_lock() {
+    if [[ -n "$HELD_LOCK" ]]; then
+        rm -f "$HELD_LOCK"
+        HELD_LOCK=""
+    fi
+}
+
+# Process a single MR bead. Returns 0 always (errors are logged, not fatal).
+process_mr() {
+    local rig="$1" mr_id="$2" refinery_dir="$3"
+
+    # cd into refinery dir early so bd can find .beads via parent walk
+    cd "$refinery_dir"
+
+    # Get full MR details (prefix routing handles rig automatically)
+    local mr_detail
+    mr_detail=$(bd show "$mr_id" --json 2>/dev/null || true)
+    if [[ -z "$mr_detail" ]]; then
+        log "$mr_id: could not read MR details, skipping"
+        return 0
+    fi
+
+    local description
+    description=$(echo "$mr_detail" | jq -r '(if type == "array" then .[0] else . end) | .description // ""')
+
+    # Parse MR fields from description
+    local branch target source_issue
+    branch=$(parse_mr_field "$description" "branch")
+    target=$(parse_mr_field "$description" "target")
+    source_issue=$(parse_mr_field "$description" "source_issue")
+
+    if [[ -z "$branch" ]] || [[ -z "$target" ]]; then
+        log "$mr_id: missing branch or target in description, skipping"
+        return 0
+    fi
+
+    log "$mr_id: $branch -> $target (source: $source_issue)"
+
+    # If source issue is already closed, close the MR and any open conflict tasks.
+    # This prevents orphaned MR beads when the source issue is closed by other means
+    # (e.g., user closes it directly, polecat merges without going through drain).
+    if [[ -n "$source_issue" ]]; then
+        local src_status
+        src_status=$(bd show "$source_issue" --json 2>/dev/null \
+            | jq -r '(if type == "array" then .[0] else . end) | .status // ""' 2>/dev/null || true)
+        if [[ "$src_status" == "closed" ]]; then
+            log "$mr_id: source issue $source_issue is closed, closing MR"
+
+            # Close any open conflict task dependencies (skip in_progress — polecat may be active)
+            local dep_ids
+            dep_ids=$(bd show "$mr_id" --json 2>/dev/null | jq -r '
+                (if type == "array" then .[0] else . end)
+                | .dependencies // []
+                | .[] | select(.status != "closed")
+                | .id' 2>/dev/null || true)
+            for dep_id in $dep_ids; do
+                local dep_status
+                dep_status=$(bd show "$dep_id" --json 2>/dev/null \
+                    | jq -r '(if type == "array" then .[0] else . end) | .status // ""' 2>/dev/null || true)
+                if [[ "$dep_status" == "in_progress" ]]; then
+                    log "$mr_id: skipping active conflict task $dep_id (in_progress)"
+                    continue
+                fi
+                drain_close "$dep_id" "source issue $source_issue closed" || true
+            done
+
+            close_all_mrs_for_branch "$branch" "source issue $source_issue closed" "$refinery_dir"
+            return 0
+        fi
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "$mr_id: DRY_RUN - would attempt rebase merge"
+        return 0
+    fi
+
+    # Fetch latest
+    git fetch origin 2>/dev/null || {
+        log "$mr_id: git fetch failed, skipping"
+        return 0
+    }
+
+    # Check if branch exists on remote
+    if ! git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+        log "$mr_id: branch '$branch' not found on remote, closing MR"
+        bd close "$mr_id" -r "branch not found on remote" 2>/dev/null || true
+        return 0
+    fi
+
+    # Check if already merged (branch tip is ancestor of target)
+    if git merge-base --is-ancestor "origin/$branch" "origin/$target" 2>/dev/null; then
+        log "$mr_id: already merged, closing"
+        bd close "$mr_id" -r "already merged" 2>/dev/null || true
+        if [[ -n "$source_issue" ]]; then
+            bd close "$source_issue" -r "Merged via $mr_id" 2>/dev/null || true
+        fi
+        git push origin --delete "$branch" 2>/dev/null || true
+        return 0
+    fi
+
+    # Check for unique commits
+    local unique_commits
+    unique_commits=$(git log --oneline "origin/$target..origin/$branch" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$unique_commits" -eq 0 ]]; then
+        log "$mr_id: no unique commits, closing MR"
+        bd close "$mr_id" -r "no unique commits" 2>/dev/null || true
+        return 0
+    fi
+
+    # Attempt rebase
+    git checkout -B temp-merge "origin/$branch" 2>/dev/null || {
+        log "$mr_id: checkout failed, skipping"
+        return 0
+    }
+
+    if git rebase "origin/$target" 2>/dev/null; then
+        # Clean rebase succeeded - push to target
+        if git push origin "temp-merge:$target" 2>/dev/null; then
+            log "$mr_id: merged successfully"
+            bd close "$mr_id" -r "merged" 2>/dev/null || true
+            if [[ -n "$source_issue" ]]; then
+                bd close "$source_issue" -r "Merged via $mr_id" 2>/dev/null || true
+            fi
+            git push origin --delete "$branch" 2>/dev/null || true
+        else
+            # Direct push blocked (branch protection). Fall back to GitHub PR.
+            log "$mr_id: direct push blocked, trying GitHub PR"
+            merge_via_pr "$mr_id" "$branch" "$target" "$source_issue" "$refinery_dir"
+        fi
+    else
+        # Conflict - abort rebase and delegate to polecat
+        git rebase --abort 2>/dev/null || true
+        log "$mr_id: rebase conflict, creating resolution task"
+
+        local target_sha
+        target_sha=$(git rev-parse "origin/$target" 2>/dev/null | head -c 12)
+
+        local retry_count
+        retry_count=$(parse_mr_field "$description" "retry_count")
+        retry_count="${retry_count:-0}"
+
+        # Dedup: check if MR already has an open conflict task dependency
+        local existing_deps
+        existing_deps=$(bd show "$mr_id" --json 2>/dev/null | jq -r '
+            (if type == "array" then .[0] else . end)
+            | .dependencies // []
+            | .[] | select(.status != "closed")
+            | .id' 2>/dev/null || true)
+        if [[ -n "$existing_deps" ]]; then
+            log "$mr_id: already has open dependency, skipping conflict task creation"
+            cd "$refinery_dir"
+            git checkout --detach HEAD 2>/dev/null || true
+            git branch -D temp-merge 2>/dev/null || true
+            return 0
+        fi
+
+        # Create conflict resolution task in the rig
+        local task_desc
+        task_desc="## Metadata
+- Original MR: $mr_id
+- Branch: $branch
+- Conflict with: ${target}@${target_sha}
+- Original issue: $source_issue
+- Retry count: $((retry_count + 1))
+
+Automated rebase of $branch onto $target failed with conflicts.
+Polecat should resolve conflicts, run tests, and push directly to $target."
+
+        local task_output
+        task_output=$(bd create --rig "$rig" \
+            --title "Resolve merge conflicts: $source_issue" \
+            --type task \
+            --priority 1 \
+            --description "$task_desc" \
+            --json 2>/dev/null || true)
+
+        local task_id
+        task_id=$(echo "$task_output" | jq -r '.id // empty' 2>/dev/null)
+
+        if [[ -n "$task_id" ]]; then
+            # Block MR on the conflict task
+            bd dep add "$mr_id" "$task_id" 2>/dev/null || true
+
+            # Sling task to polecat for resolution
+            cd "$GT"
+            if gt sling "$task_id" "$rig" --no-boot \
+                --formula mol-polecat-conflict-resolve \
+                --var "base_branch=$target" 2>/dev/null; then
+                log "$mr_id: conflict task $task_id slung to $rig"
+            else
+                log "$mr_id: failed to sling conflict task $task_id"
+            fi
+        else
+            log "$mr_id: failed to create conflict task"
+        fi
+    fi
+
+    # Cleanup local temp-merge branch.
+    # Detach HEAD so the target branch (usually main) is not "checked out" —
+    # otherwise git refuses pushes to that branch from other clones (e.g., mayor/rig).
+    cd "$refinery_dir"
+    git checkout --detach HEAD 2>/dev/null || true
+    git branch -D temp-merge 2>/dev/null || true
+
+    return 0
+}
+
+# Process all MR beads for a single rig
+process_rig() {
+    local rig="$1"
+    local refinery_dir="$GT/$rig/refinery/rig"
+
+    # Skip rigs without refinery worktree (check for git worktree marker)
+    if [[ ! -d "$refinery_dir/.git" ]] && [[ ! -f "$refinery_dir/.git" ]]; then
+        return 0
+    fi
+
+    # Query open MR beads, sorted by priority then creation time
+    # gt done creates MR beads with label gt:merge-request (not type merge-request),
+    # and doesn't set the rig field, so we cd into the refinery dir for bd routing
+    # and query by label instead of type.
+    local mrs bd_stderr_file
+    bd_stderr_file=$(mktemp)
+    mrs=$(cd "$refinery_dir" && bd list --label-any gt:merge-request --status open --json --limit 0 --sort priority 2>"$bd_stderr_file") || {
+        local bd_err
+        bd_err=$(cat "$bd_stderr_file" 2>/dev/null)
+        rm -f "$bd_stderr_file"
+        log "$rig: bd list failed: $bd_err"
+        FOUND_ERRORS=true
+        return 0
+    }
+    rm -f "$bd_stderr_file"
+
+    if [[ -z "$mrs" ]] || [[ "$mrs" == "[]" ]] || [[ "$mrs" == "null" ]]; then
+        return 0
+    fi
+
+    # Filter to unblocked MRs (dependency_count == 0 means not blocked)
+    local ready_mrs
+    ready_mrs=$(echo "$mrs" | jq -c '[.[] | select(.dependency_count == 0)]')
+    local count
+    count=$(echo "$ready_mrs" | jq 'length')
+
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    FOUND_WORK=true
+    log "$rig: $count MR(s) ready"
+
+    # Acquire file lock for serialization
+    if ! acquire_lock "$rig"; then
+        return 0
+    fi
+
+    # Process MRs serially using process substitution (avoids subshell)
+    while IFS= read -r mr_id; do
+        [[ -z "$mr_id" ]] && continue
+        process_mr "$rig" "$mr_id" "$refinery_dir"
+    done < <(echo "$ready_mrs" | jq -r '.[].id')
+
+    release_lock
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────
+FOUND_WORK=false
+FOUND_ERRORS=false
+
+for rig in $(discover_rigs); do
+    process_rig "$rig"
+done
+
+if [[ "$FOUND_WORK" == "false" && "$FOUND_ERRORS" == "false" ]]; then
+    log "(empty queue)"
+fi

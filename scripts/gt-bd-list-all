@@ -1,0 +1,80 @@
+#!/bin/bash
+# gt-bd-list-all - Query bd list across HQ + all rigs, return merged JSON array
+#
+# Reads routes.jsonl to discover rigs, runs bd list for each, merges results.
+# Passes all arguments through to bd list. Supports multiple --status= flags
+# by running a separate query per status per target.
+#
+# Usage:
+#   gt-bd-list-all --status=hooked --json --limit=0
+#   gt-bd-list-all --status=hooked --status=in_progress --json --limit=0
+
+set -euo pipefail
+
+GT="${GT:-/Users/davidtarico/gt}"
+
+# Parse out --status= flags (may be multiple) and collect remaining args
+STATUSES=()
+OTHER_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --status=*) STATUSES+=("$arg") ;;
+        *) OTHER_ARGS+=("$arg") ;;
+    esac
+done
+
+# If no explicit statuses, pass args through as-is (single query per target)
+if [[ ${#STATUSES[@]} -eq 0 ]]; then
+    STATUSES=("")
+fi
+
+# Discover rigs from routes.jsonl (exclude hq- prefixes — HQ is queried separately without --rig)
+RIGS=""
+if [[ -f "$GT/.beads/routes.jsonl" ]]; then
+    RIGS=$(jq -r 'select(.prefix | test("^hq-") | not) | .path' "$GT/.beads/routes.jsonl" 2>/dev/null | sort -u)
+fi
+
+# Collect all results
+ALL_RESULTS="[]"
+
+merge_results() {
+    local new_json="$1"
+    if [[ -z "$new_json" ]] || [[ "$new_json" == "[]" ]] || [[ "$new_json" == "null" ]]; then
+        return
+    fi
+    # Validate JSON before merging
+    if ! echo "$new_json" | jq empty 2>/dev/null; then
+        return
+    fi
+    if [[ "$ALL_RESULTS" == "[]" ]]; then
+        ALL_RESULTS="$new_json"
+    else
+        ALL_RESULTS=$(echo "$ALL_RESULTS" "$new_json" | jq -s 'add')
+    fi
+}
+
+for status_flag in "${STATUSES[@]}"; do
+    # Build args for this query
+    QUERY_ARGS=("${OTHER_ARGS[@]}")
+    if [[ -n "$status_flag" ]]; then
+        QUERY_ARGS+=("$status_flag")
+    fi
+
+    # Query HQ (no --rig flag)
+    HQ_RESULT=$(cd "$GT" && bd list "${QUERY_ARGS[@]}" 2>/dev/null) || true
+    merge_results "$HQ_RESULT"
+
+    # Query each rig
+    for rig_path in $RIGS; do
+        rig_dir=$(echo "$rig_path" | cut -d/ -f1)
+        RIG_RESULT=$(cd "$GT" && bd list --rig "$rig_dir" "${QUERY_ARGS[@]}" 2>/dev/null) || true
+        merge_results "$RIG_RESULT"
+    done
+done
+
+# Deduplicate by bead ID
+if [[ "$ALL_RESULTS" != "[]" ]]; then
+    ALL_RESULTS=$(echo "$ALL_RESULTS" | jq '[group_by(.id)[] | first]')
+fi
+
+echo "$ALL_RESULTS"
