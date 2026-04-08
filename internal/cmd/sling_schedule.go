@@ -80,15 +80,22 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("'%s' is not a known rig", rigName)
 	}
 
-	if !opts.Force {
-		if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
-			return err
-		}
+	// NOT bypassed by --force: wrong-prefix beads cause cascading failures in
+	// done/patrol/nuke flows. Fix the bead prefix instead. (hq-i9ubn9 postmortem)
+	if err := checkCrossRigGuard(beadID, rigName+"/polecats/_", townRoot); err != nil {
+		return err
 	}
 
 	info, err := getBeadInfo(beadID)
 	if err != nil {
 		return fmt.Errorf("checking bead status: %w", err)
+	}
+
+	// Fail fast on missing requirements — same check as runSling (direct path)
+	// and executeSling (dispatch path). Without this, deferred dispatch silently
+	// accepts beads that will fail at dispatch time after creating convoys.
+	if err := checkWorkspaceRequirements(beadID, info.IssueType); err != nil {
+		return err
 	}
 
 	// Idempotency: check for existing open sling context for this work bead.

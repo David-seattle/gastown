@@ -592,6 +592,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("refusing to sling deferred bead %s: %q\nDeferred work should not consume polecat slots. Use --force to override", beadID, info.Title)
 	}
 
+	// Guard against slinging bugs/features without workspace requirements.
+	// INTENTIONALLY not gated on --force. Requirements are non-negotiable for
+	// bugs/features. If you think you need --force here, the bead type is wrong.
+	if err := checkWorkspaceRequirements(beadID, info.IssueType); err != nil {
+		return err
+	}
+
 	originalStatus := info.Status
 	originalAssignee := info.Assignee
 	force := slingForce // local copy to avoid mutating package-level flag
@@ -693,8 +700,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Cross-rig guard: prevent slinging beads to polecats in the wrong rig (gt-myecw).
 	// Polecats work in their rig's worktree and cannot fix code owned by another rig.
-	// Skip for self-sling (user knows what they're doing) and --force overrides.
-	if strings.Contains(targetAgent, "/polecats/") && !force && !isSelfSling {
+	// Skip for self-sling (user knows what they're doing).
+	// NOT bypassed by --force: wrong-prefix beads cause cascading failures in
+	// done/patrol/nuke flows. Fix the bead prefix instead. (hq-i9ubn9 postmortem)
+	if strings.Contains(targetAgent, "/polecats/") && !isSelfSling {
 		if err := checkCrossRigGuard(beadID, targetAgent, townRoot); err != nil {
 			return err
 		}
@@ -1055,12 +1064,10 @@ func checkCrossRigGuard(beadID, targetAgent, townRoot string) error {
 	if beadRig != targetRig {
 		if beadRig == "" {
 			return fmt.Errorf("bead %s (prefix %q) is not in rig %q — it belongs to town root\n"+
-				"Create the task from the rig directory: cd %s && bd create --title=...\n"+
-				"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
+				"Create the task from the rig directory: cd %s && bd create --title=...", beadID, strings.TrimSuffix(beadPrefix, "-"), targetRig, targetRig)
 		}
 		return fmt.Errorf("cross-rig mismatch: bead %s (prefix %q) belongs to rig %q, but target is rig %q\n"+
-			"Create the task from the target rig: cd %s && bd create --title=...\n"+
-			"Use --force to override", beadID, strings.TrimSuffix(beadPrefix, "-"), beadRig, targetRig, targetRig)
+			"Create the task from the target rig: cd %s && bd create --title=...", beadID, strings.TrimSuffix(beadPrefix, "-"), beadRig, targetRig, targetRig)
 	}
 
 	return nil

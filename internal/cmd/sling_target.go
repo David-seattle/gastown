@@ -195,7 +195,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			}
 		}
 
-		if opts.BeadID != "" && !opts.Force {
+		if opts.BeadID != "" {
 			if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 				return nil, err
 			}
@@ -238,7 +238,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			parts := strings.Split(target, "/")
 			if len(parts) >= 3 && parts[1] == "polecats" {
 				rigName := parts[0]
-				if opts.BeadID != "" && !opts.Force {
+				if opts.BeadID != "" {
 					if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 						return nil, err
 					}
