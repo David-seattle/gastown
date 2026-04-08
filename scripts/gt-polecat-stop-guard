@@ -1,0 +1,80 @@
+#!/bin/bash
+# gt-polecat-stop-guard — Claude Code Stop hook for polecats.
+#
+# Blocks the session from stopping unless gt done was called successfully.
+# Prevents polecats from yielding without submitting their work.
+# Polecats that are blocked can always exit via: gt done --status ESCALATED
+#
+# Input (JSON on stdin):
+#   session_id, transcript_path, stop_hook_active, last_assistant_message, ...
+#
+# Output (JSON on stdout):
+#   {"decision": "block", "reason": "..."} to prevent stop
+#   (empty or non-JSON to allow stop)
+
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+INPUT=$(cat)
+
+# Debug logging for polecat session lifecycle investigation
+DEBUG_LOG="/tmp/polecat-stop-guard-debug.log"
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "unknown"')
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) STOP-GUARD session=$SESSION_ID polecat=${GT_POLECAT:-none} role=${GT_ROLE:-none}" >> "$DEBUG_LOG"
+echo "  input_keys: $(echo "$INPUT" | jq -c 'keys')" >> "$DEBUG_LOG"
+
+# Only enforce for polecats
+[[ -z "${GT_POLECAT:-}" ]] && exit 0
+
+# Track block count per session to detect loops. After repeated blocks without
+# the polecat calling gt done, escalate the message to force gt done --status ESCALATED.
+BLOCK_COUNT_FILE="/tmp/polecat-stop-guard-${SESSION_ID}.count"
+BLOCK_COUNT=$(cat "$BLOCK_COUNT_FILE" 2>/dev/null || echo 0)
+BLOCK_COUNT=${BLOCK_COUNT//[^0-9]/}
+BLOCK_COUNT=${BLOCK_COUNT:-0}
+BLOCK_COUNT=$((BLOCK_COUNT + 1))
+echo "$BLOCK_COUNT" > "$BLOCK_COUNT_FILE"
+
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+[[ -z "$TRANSCRIPT" ]] || [[ ! -f "$TRANSCRIPT" ]] && exit 0
+
+# Search for successful gt done calls in the transcript.
+#
+# Strategy:
+#   1. grep for JSONL lines containing a "gt done" Bash command
+#   2. jq to extract tool_use IDs from those lines
+#   3. For each ID, find the result line and check for success
+#
+# A gt done is successful when its result has is_error != true
+# and the output does not contain "cannot complete".
+
+TOOL_IDS=$(grep '"command":"gt done' "$TRANSCRIPT" \
+    | jq -r '.message.content[]
+        | select(.type == "tool_use" and .name == "Bash")
+        | .id' 2>/dev/null) || true
+
+for id in $TOOL_IDS; do
+    # grep for the result line containing this tool_use_id
+    # The result is a type="user" message with a tool_result block
+    MATCH=$(grep "$id" "$TRANSCRIPT" \
+        | jq -e '.message.content[]
+            | select(.type == "tool_result" and .tool_use_id == "'"$id"'")
+            | select(.is_error != true)
+            | select((.content | tostring) | test("cannot complete") | not)' 2>/dev/null) || true
+
+    if [[ -n "$MATCH" ]]; then
+        # Found a successful gt done — allow stop and clean up count file
+        rm -f "$BLOCK_COUNT_FILE"
+        exit 0
+    fi
+done
+
+# gt done was never successfully called — block stop
+MAX_BLOCKS=5
+if [[ $BLOCK_COUNT -ge $MAX_BLOCKS ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) STOP-GUARD FORCING ESCALATION (blocked $BLOCK_COUNT times) session=$SESSION_ID" >> "$DEBUG_LOG"
+    echo '{"decision": "block", "reason": "STOP HOOK HAS BLOCKED YOU '$BLOCK_COUNT' TIMES. You are stuck in a loop. Run this command RIGHT NOW: gt done --status ESCALATED"}'
+else
+    echo '{"decision": "block", "reason": "You must complete all the steps and call gt done before your session can end. Fix the things that are not yet complete."}'
+fi

@@ -1,0 +1,9 @@
+NEVER manually work around automation failures.
+When something isn't working (stuck beads, failed dispatch, missed cleanup):
+1. Diagnose WHY the automation didn't handle it. Do not manually work around the issue — fix the underlying problem, not the symptom.
+2. Break the problem down methodically. Check one component at a time, isolating potential failure points. If the cause isn't obvious from reading the code or running a couple of tests, add debug logging.
+3. Write a failing test (RED), fix the root cause in the automation, confirm GREEN.
+4. Deploy and wait for automation to verify end-to-end. Never work around the system by running a job or task manually. The goal is not to unblock this particular instance — it's to find and fix the underlying cause.
+5. Prove the root cause with evidence and verified facts. No guesses, no assumptions.
+Do NOT close, dispatch, sling, nuke, or unblock anything manually.
+The goal is rock-solid automation, not unblocking one instance.

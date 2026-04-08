@@ -1,0 +1,90 @@
+#!/bin/bash
+# gt-mayor-autopush - Push unpushed mayor/rig commits to origin
+#
+# Used as:
+#   1. A git post-commit hook in mayor/rig clones (immediate push after commit)
+#   2. Called by gt-patrol as a safety net (catches anything that slipped through)
+#
+# When called with no arguments, processes all rig mayor/rig clones.
+# When run as a post-commit hook (inside a git repo), pushes only that repo.
+#
+# Safe to run repeatedly — no-ops if nothing to push.
+
+set -euo pipefail
+
+GT=/Users/davidtarico/gt
+
+log() { echo "  [autopush] $*"; }
+
+push_if_needed() {
+    local clone_dir="$1" label="$2"
+    cd "$clone_dir"
+
+    # Skip if .no-autopush marker exists (rig owner controls deploy timing)
+    if [[ -f "$clone_dir/.no-autopush" ]]; then
+        return 0
+    fi
+
+    # Skip if not on a branch (detached HEAD)
+    local branch
+    branch=$(git symbolic-ref --short HEAD 2>/dev/null || true)
+    if [[ -z "$branch" ]]; then
+        return 0
+    fi
+
+    # Skip if no upstream tracking branch
+    local upstream
+    upstream=$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || true)
+    if [[ -z "$upstream" ]]; then
+        return 0
+    fi
+
+    # Check for unpushed commits
+    local ahead
+    ahead=$(git rev-list --count "$upstream..HEAD" 2>/dev/null || echo "0")
+    if [[ "$ahead" -eq 0 ]]; then
+        return 0
+    fi
+
+    log "$label: $ahead unpushed commit(s) on $branch"
+
+    # Try simple push first
+    if git push origin "$branch" 2>/dev/null; then
+        log "$label: pushed successfully"
+        return 0
+    fi
+
+    # Push failed — origin may have moved. Rebase and retry.
+    log "$label: push failed, trying rebase..."
+    if git pull --rebase origin "$branch" 2>/dev/null; then
+        if git push origin "$branch" 2>/dev/null; then
+            log "$label: rebased and pushed"
+            return 0
+        fi
+    fi
+
+    log "$label: WARNING — could not push (manual intervention needed)"
+    return 1
+}
+
+# If running as a post-commit hook (GIT_DIR is set by git), push this repo only
+if [[ -n "${GIT_DIR:-}" ]]; then
+    # Resolve the working directory from GIT_DIR
+    REPO_DIR=$(cd "$GIT_DIR" && git rev-parse --show-toplevel 2>/dev/null || dirname "$GIT_DIR")
+    push_if_needed "$REPO_DIR" "$(basename "$REPO_DIR")" || true
+    exit 0
+fi
+
+# Patrol mode: iterate all rig mayor/rig clones
+PUSHED=0
+RIGS=$(jq -r 'select(.prefix | test("^hq-") | not) | .path' "$GT/.beads/routes.jsonl" 2>/dev/null | sort -u)
+
+for rig_path in $RIGS; do
+    clone="$GT/$rig_path/mayor/rig"
+    if [[ -d "$clone/.git" ]] || [[ -f "$clone/.git" ]]; then
+        if push_if_needed "$clone" "$rig_path"; then
+            # Check if we actually pushed (function logged it)
+            true
+        fi
+    fi
+done
