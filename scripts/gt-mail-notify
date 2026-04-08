@@ -1,0 +1,113 @@
+#!/bin/bash
+# gt-mail-notify - Monitor mayor's inbox and send Slack notifications
+#
+# Polls the mayor's unread mail and sends a Slack DM for each new message.
+# Tracks notified message IDs in a state file to avoid duplicates.
+#
+# Designed to run via launchd every 60 seconds.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="$SCRIPT_DIR:$HOME/.local/bin:$HOME/go/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export BEADS_DOLT_AUTO_START=0
+
+STATE_DIR="$HOME/.claude/projects/-Users-davidtarico-gt"
+STATE_FILE="$STATE_DIR/mail-notify-seen.txt"
+SLACK_CHANNEL="D0AC1MNNQ4C"
+BOT_TOKEN=$(security find-generic-password -a "gt-mail-notify" -s "slack-bot-token" -w 2>/dev/null) || {
+    echo "$(TS)   ERROR: cannot read bot token from Keychain"
+    exit 1
+}
+LOG_PREFIX="gt-mail-notify"
+
+TS() { date '+%H:%M:%S'; }
+
+send_slack() {
+    curl -s -X POST "https://slack.com/api/chat.postMessage" \
+        -H "Authorization: Bearer $BOT_TOKEN" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        -d "{\"channel\": \"$SLACK_CHANNEL\", \"text\": $(echo "$1" | jq -Rs .)}" >/dev/null 2>&1 || return 1
+}
+
+# Ensure state file exists
+touch "$STATE_FILE"
+
+echo "$(TS) ── $LOG_PREFIX checking mayor inbox ──"
+
+# Fetch unread mail as JSON
+INBOX=$(gt mail inbox mayor/ --unread --json 2>/dev/null) || {
+    echo "$(TS)   inbox check failed (rc=$?)"
+    exit 0
+}
+
+# Count messages
+COUNT=$(echo "$INBOX" | jq 'length' 2>/dev/null) || COUNT=0
+if [[ "$COUNT" -eq 0 ]]; then
+    echo "$(TS)   no unread mail"
+    exit 0
+fi
+
+echo "$(TS)   $COUNT unread message(s)"
+
+NOTIFIED=0
+
+echo "$INBOX" | jq -c '.[]' | while IFS= read -r msg; do
+    MSG_ID=$(echo "$msg" | jq -r '.id')
+
+    # Skip if already notified
+    if grep -qF "$MSG_ID" "$STATE_FILE" 2>/dev/null; then
+        continue
+    fi
+
+    FROM=$(echo "$msg" | jq -r '.from // "unknown"')
+    SUBJECT=$(echo "$msg" | jq -r '.subject // "(no subject)"')
+    BODY=$(echo "$msg" | jq -r '.body // ""')
+    PRIORITY=$(echo "$msg" | jq -r '.priority // "normal"')
+    MSG_TYPE=$(echo "$msg" | jq -r '.type // "notification"')
+    TIMESTAMP=$(echo "$msg" | jq -r '.timestamp // ""')
+
+    # Truncate body for Slack (keep it readable)
+    if [[ ${#BODY} -gt 500 ]]; then
+        BODY="${BODY:0:500}..."
+    fi
+
+    # Build priority indicator
+    PRIORITY_TAG=""
+    case "$PRIORITY" in
+        urgent) PRIORITY_TAG="🔴 *URGENT* " ;;
+        high)   PRIORITY_TAG="🟠 *HIGH* " ;;
+        *)      PRIORITY_TAG="" ;;
+    esac
+
+    # Format Slack message
+    SLACK_MSG="${PRIORITY_TAG}*Mayor Mail* — ${MSG_TYPE}
+*From:* ${FROM}
+*Subject:* ${SUBJECT}"
+
+    if [[ -n "$BODY" ]]; then
+        SLACK_MSG="${SLACK_MSG}
+\`\`\`${BODY}\`\`\`"
+    fi
+
+    if [[ -n "$TIMESTAMP" ]]; then
+        SLACK_MSG="${SLACK_MSG}
+_${TIMESTAMP}_"
+    fi
+
+    # Send Slack notification via OpenClaw bot
+    if send_slack "$SLACK_MSG"; then
+        echo "$(TS)   notified: $SUBJECT (from $FROM)"
+        echo "$MSG_ID" >> "$STATE_FILE"
+        NOTIFIED=$((NOTIFIED + 1))
+    else
+        echo "$(TS)   WARNING: Slack send failed for $MSG_ID"
+    fi
+done
+
+# Prune state file to last 500 entries to prevent unbounded growth
+if [[ $(wc -l < "$STATE_FILE") -gt 500 ]]; then
+    tail -300 "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+fi
+
+echo "$(TS) ── $LOG_PREFIX done ──"

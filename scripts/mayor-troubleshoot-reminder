@@ -1,0 +1,36 @@
+#!/bin/bash
+# mayor-troubleshoot-reminder - Periodic reminder of troubleshooting process
+#
+# Injects a reminder of the systematic troubleshooting process if:
+#   1. GT_ROLE is "mayor"
+#   2. 30+ minutes since last injection
+#
+# Designed to run as a Claude Code PostToolUse hook.
+
+# Only for mayor sessions
+[[ "${GT_ROLE:-}" != "mayor" ]] && exit 0
+
+STAMP_FILE="/tmp/gt-mayor-troubleshoot-reminder.stamp"
+INTERVAL=1800  # 30 minutes in seconds
+
+# Check elapsed time since last injection
+if [[ -f "$STAMP_FILE" ]]; then
+    LAST=$(cat "$STAMP_FILE" 2>/dev/null || echo 0)
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - LAST))
+    [[ $ELAPSED -lt $INTERVAL ]] && exit 0
+fi
+
+# Update timestamp
+date +%s > "$STAMP_FILE"
+
+# Inject reminder from shared file
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROCESS_FILE="$SCRIPT_DIR/troubleshoot-process.txt"
+
+if [[ -f "$PROCESS_FILE" ]]; then
+    echo "[TROUBLESHOOTING PROCESS REMINDER] If investigating a failure:"
+    cat "$PROCESS_FILE"
+else
+    echo "[TROUBLESHOOTING PROCESS REMINDER] Follow systematic troubleshooting. Fix root causes, not symptoms."
+fi

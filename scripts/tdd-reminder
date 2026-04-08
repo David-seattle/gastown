@@ -1,0 +1,54 @@
+#!/bin/bash
+# PostToolUse hook: remind to use red/green TDD when writing code files.
+# Reads JSON from stdin (per Claude Code hooks spec), extracts file_path,
+# checks if extension is code, and checks if we're in a git repo.
+
+# Read JSON input from stdin
+input=$(cat)
+[ -z "$input" ] && exit 0
+
+# Extract file_path from tool_input
+file_path=$(echo "$input" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))" 2>/dev/null)
+[ -z "$file_path" ] && exit 0
+
+# Check if the file is code: known code extension, or no extension (scripts).
+case "$file_path" in
+  *.go|*.ts|*.tsx|*.js|*.jsx|*.py|*.rb|*.rs|*.java|*.kt|*.swift|*.c|*.cpp|*.h|*.cs|*.sh|*.bash|*.zsh|*.pl|*.ex|*.exs|*.scala|*.clj|*.lua|*.r|*.R|*.php|*.dart|*.zig|*.nim|*.ml|*.hs|*.erl|*.elm)
+    ;;
+  *)
+    # No extension = script/code; any other extension = not code
+    case "$(basename "$file_path")" in
+      *.*) exit 0 ;;
+    esac
+    ;;
+esac
+
+# Skip test files — they're part of TDD, no need to nag
+case "$file_path" in
+  *_test.go|*_test.ts|*_test.js|*.test.ts|*.test.js|*.test.tsx|*.test.jsx|*.spec.ts|*.spec.js|*_spec.rb|*test_*.py|*_test.py|*.test.py)
+    exit 0
+    ;;
+esac
+
+# Only fire inside a git repo — walk up from the file's directory
+dir=$(dirname "$file_path")
+in_git=false
+while [ "$dir" != "/" ]; do
+  if [ -d "$dir/.git" ]; then
+    in_git=true
+    break
+  fi
+  dir=$(dirname "$dir")
+done
+[ "$in_git" = "false" ] && exit 0
+
+# Output JSON with additionalContext so Claude sees the reminder
+/usr/bin/python3 -c "
+import json
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PostToolUse',
+        'additionalContext': 'Remember to do red/green TDD BEFORE changing any code logic.'
+    }
+}))
+"
