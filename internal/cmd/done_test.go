@@ -1486,3 +1486,29 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// TestShouldCloseHookedBead verifies the decision logic for when gt done
+// should close the hooked bead vs leave it for the refinery.
+func TestShouldCloseHookedBead(t *testing.T) {
+	tests := []struct {
+		name      string
+		mrID      string
+		exitType  string
+		wantClose bool
+	}{
+		{"MR created → skip close (refinery will close after merge)", "sa-wisp-abc", ExitCompleted, false},
+		{"no MR (direct/no-commits) → close", "", ExitCompleted, true},
+		{"escalated → skip close (recovery needs bead open)", "", ExitEscalated, false},
+		{"deferred with MR → skip close", "sa-wisp-xyz", ExitDeferred, false},
+		{"deferred no MR → close", "", ExitDeferred, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := shouldCloseHookedBead(tt.mrID, tt.exitType)
+			if result != tt.wantClose {
+				t.Errorf("shouldCloseHookedBead(mrID=%q, exitType=%q) = %v, want %v",
+					tt.mrID, tt.exitType, result, tt.wantClose)
+			}
+		})
+	}
+}
