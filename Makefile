@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install check-forward-only clean test test-scripts test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -143,6 +143,14 @@ clean:
 
 test:
 	go test ./...
+
+test-scripts:
+	@echo "Running script tests..."
+	@bash scripts/gt-bd-list-all_test.sh
+	@bash scripts/gt-polecat-recover_test.sh
+	@bash scripts/gt-refinery-drain_test.sh
+	@bash scripts/gt-patrol_test.sh
+	@echo "All script tests passed."
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:

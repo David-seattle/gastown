@@ -1,0 +1,354 @@
+#!/bin/bash
+# gt-patrol - Lightweight deacon+witness replacement
+#
+# Runs the basic Gas Town maintenance loop:
+#   1. Recover stale hooks (beads stuck on dead agents) + re-sling polecat work
+#   2. Process merge queue (rebase clean merges, delegate conflicts to polecats)
+#   3. Push unpushed mayor/rig commits (prevents ff-only pull failures)
+#   4. Sync rig clones (ff-only pull from origin after merges land)
+#   5. Clean up done/idle polecats (free worktrees + sessions)
+#   6. Dispatch queued work (via gt sling --no-boot, NOT gt scheduler run)
+#   7. Close completed convoys
+#   8. Kill orphaned tmux sessions
+#   9. Close system noise beads (compaction reports, dead agent alerts, etc.)
+#
+# NOTE: Drain (step 2) runs before nuke (step 4) so MR branches get merged
+# before the polecat worktree cleanup deletes them.
+#
+# Designed to run via launchd every 3 minutes.
+
+set -euo pipefail
+
+# Ensure PATH includes locations needed when running from launchd
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="$SCRIPT_DIR:$HOME/.local/bin:$HOME/go/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Prevent bd from spawning per-rig Dolt servers (all rigs share the central server on 3307)
+export BEADS_DOLT_AUTO_START=0
+
+TS() { date '+%H:%M:%S'; }
+GT=/Users/davidtarico/gt
+
+echo "$(TS) ── gt-patrol starting ──"
+
+# ── Step 1: Recover stale hooks ──────────────────────────────────────────
+echo "$(TS) [1/9] Recovering stale hooks..."
+gt-polecat-recover --fix --resling 2>&1 || true
+
+# ── Step 2: Process merge queue ───────────────────────────────────────────
+# Drain runs BEFORE polecat cleanup so MR branches get merged before nuke
+# deletes them from the remote.
+echo "$(TS) [2/9] Processing merge queue..."
+gt-refinery-drain 2>&1 || echo "  drain failed (rc=$?)"
+
+# ── Step 3: Push unpushed mayor commits ─────────────────────────────────────
+# Mayor sessions may commit without pushing (e.g., context compaction mid-session).
+# Push them now so the sync step's ff-only pull doesn't fail on diverged branches.
+echo "$(TS) [3/9] Pushing unpushed mayor commits..."
+gt-mayor-autopush 2>&1 || echo "  autopush failed (rc=$?)"
+
+# ── Step 4: Sync rig clones ────────────────────────────────────────────────
+# After drain merges to origin/main, rig clones may be behind. Pull ff-only
+# so the rig has the latest code (for builds, container restarts, etc.).
+echo "$(TS) [4/9] Syncing rig clones..."
+SYNC_COUNT=0
+SYNC_RIGS=$(jq -r 'select(.prefix | test("^hq-") | not) | .path' "$GT/.beads/routes.jsonl" 2>/dev/null | sort -u)
+for sync_rig_path in $SYNC_RIGS; do
+    sync_clone="$GT/$sync_rig_path/mayor/rig"
+    if [[ -d "$sync_clone/.git" ]] || [[ -f "$sync_clone/.git" ]]; then
+        if PULL_OUT=$(cd "$sync_clone" && git pull --ff-only 2>&1); then
+            if ! echo "$PULL_OUT" | grep -q "Already up to date"; then
+                echo "  $sync_rig_path: updated"
+                SYNC_COUNT=$((SYNC_COUNT + 1))
+            fi
+        else
+            echo "  $sync_rig_path: ff-only pull failed (rc=$?)"
+        fi
+    fi
+done
+[[ $SYNC_COUNT -eq 0 ]] && echo "  (none)"
+
+# ── Step 5: Clean up done/idle polecats ──────────────────────────────────
+echo "$(TS) [5/9] Cleaning up done polecats..."
+POLECATS=$(cd "$GT" && gt polecat list --all --json 2>/dev/null || echo "[]")
+
+if [[ -n "$POLECATS" ]] && [[ "$POLECATS" != "[]" ]] && [[ "$POLECATS" != "null" ]]; then
+    TARGETS=$(echo "$POLECATS" | jq -r '.[] | select(.state=="done" or .state=="idle") | "\(.rig)/\(.name)"' 2>/dev/null)
+    if [[ -n "$TARGETS" ]]; then
+        while IFS= read -r pc; do
+            echo "  Nuking: $pc"
+            cd "$GT" && gt polecat nuke "$pc" --force 2>&1 || echo "  Failed: $pc"
+        done <<< "$TARGETS"
+    else
+        echo "  (none)"
+    fi
+else
+    echo "  (none)"
+fi
+
+# ── Step 6: Dispatch queued work ─────────────────────────────────────────
+# gt scheduler run dispatches queued beads and spawns polecats.
+# The gt binary has been patched to skip wakeRigAgents (which would boot
+# witness/refinery/factory). Only polecats are spawned.
+echo "$(TS) [6/9] Dispatching queued work..."
+# Log scheduler queue state before dispatching (JSON — no fragile Unicode parsing)
+SCHED_JSON=$(cd "$GT" && gt scheduler status --json 2>/dev/null) || true
+if [[ -n "$SCHED_JSON" ]] && echo "$SCHED_JSON" | jq empty 2>/dev/null; then
+    QUEUE_COUNT=$(echo "$SCHED_JSON" | jq -r '.queued_total')
+    QUEUE_READY=$(echo "$SCHED_JSON" | jq -r '.queued_ready')
+    echo "  queue: ${QUEUE_COUNT} scheduled, ${QUEUE_READY} ready"
+    if [[ "$QUEUE_COUNT" -gt 0 ]]; then
+        echo "$SCHED_JSON" | jq -r '.beads[] | "    \(.status) \(.id): \(.title)"' || true
+    fi
+else
+    echo "  queue: (status unavailable)"
+fi
+
+if DISPATCH_OUT=$(cd "$GT" && gt scheduler run --batch=10 2>&1); then
+    DISPATCH_RC=0
+else
+    DISPATCH_RC=$?
+fi
+if echo "$DISPATCH_OUT" | grep -q "Dispatched [1-9]"; then
+    echo "$DISPATCH_OUT" | grep -E "Dispatching|Dispatched"
+elif [[ -z "$DISPATCH_OUT" ]] && [[ $DISPATCH_RC -eq 0 ]]; then
+    echo "  (none)"
+else
+    echo "  dispatch output (rc=$DISPATCH_RC): $DISPATCH_OUT"
+fi
+
+# Check for circuit-broken sling contexts and notify mayor
+if echo "$DISPATCH_OUT" | grep -q "circuit-broken"; then
+    PROCESS_TEXT=""
+    if [[ -f "$SCRIPT_DIR/troubleshoot-process.txt" ]]; then
+        PROCESS_TEXT=$(cat "$SCRIPT_DIR/troubleshoot-process.txt")
+    fi
+    while IFS= read -r cb_line; do
+        CB_CONTEXT=$(echo "$cb_line" | sed -n 's/.*Context \([^ ]*\).*/\1/p')
+        CB_WORK=$(echo "$cb_line" | sed -n 's/.*(work: \([^)]*\)).*/\1/p')
+        CB_FAILURES=$(echo "$cb_line" | sed -n 's/.*failed \([0-9]*\) times.*/\1/p')
+        echo "  CIRCUIT-BREAKER: $CB_WORK (context: $CB_CONTEXT, failures: $CB_FAILURES)"
+        MAIL_BODY="Sling context ${CB_CONTEXT} for bead ${CB_WORK} has been circuit-broken after ${CB_FAILURES} consecutive dispatch failures.
+
+${PROCESS_TEXT}"
+        cd "$GT" && gt mail send mayor/ \
+            -s "Circuit-breaker: ${CB_WORK}" \
+            -m "$MAIL_BODY" \
+            --priority 1 2>/dev/null || echo "  WARNING: failed to send circuit-breaker mail for $CB_WORK"
+    done < <(echo "$DISPATCH_OUT" | grep "circuit-broken")
+fi
+
+# ── Step 7a: Auto-close epics whose children are all closed ────────────────
+echo "$(TS) [7/9] Checking epics for auto-close..."
+CONVOYS=$(cd "$GT" && gt convoy list --json 2>/dev/null || echo "[]")
+EPICS_CLOSED=0
+
+if [[ -n "$CONVOYS" ]] && [[ "$CONVOYS" != "[]" ]] && [[ "$CONVOYS" != "null" ]]; then
+    while IFS= read -r convoy; do
+        CID=$(echo "$convoy" | jq -r '.id')
+        CSTATUS=$(echo "$convoy" | jq -r '.status')
+        [[ "$CSTATUS" != "open" ]] && continue
+
+        # Find open epics in this convoy
+        OPEN_EPICS=$(echo "$convoy" | jq -r '(.tracked // [])[] | select(.issue_type=="epic" and .status!="closed") | .id')
+        [[ -z "$OPEN_EPICS" ]] && continue
+
+        # Check if all non-epic beads are closed (skip if none exist yet)
+        NON_EPIC_TOTAL=$(echo "$convoy" | jq '[(.tracked // [])[] | select(.issue_type!="epic")] | length')
+        [[ "$NON_EPIC_TOTAL" -eq 0 ]] && continue
+        NON_EPIC_OPEN=$(echo "$convoy" | jq '[(.tracked // [])[] | select(.issue_type!="epic" and .status!="closed")] | length')
+        [[ "$NON_EPIC_OPEN" -ne 0 ]] && continue
+
+        # All non-epic children closed — close the epic(s)
+        while IFS= read -r epic_id; do
+            [[ -z "$epic_id" ]] && continue
+            echo "  Auto-closing epic: $epic_id (all children in $CID closed)"
+            cd "$GT" && bd close "$epic_id" --reason="All children closed (auto-close by gt-patrol)" 2>&1 || echo "  Failed: $epic_id"
+            EPICS_CLOSED=$((EPICS_CLOSED + 1))
+        done <<< "$OPEN_EPICS"
+    done < <(echo "$CONVOYS" | jq -c '.[]')
+fi
+[[ $EPICS_CLOSED -eq 0 ]] && echo "  (none)"
+
+# ── Step 7b: Close completed convoys ──────────────────────────────────────
+echo "$(TS) [7b/9] Closing completed convoys..."
+# Re-fetch convoys since epics may have just been closed
+CONVOYS=$(cd "$GT" && gt convoy list --json 2>/dev/null || echo "[]")
+CLOSED=0
+
+if [[ -n "$CONVOYS" ]] && [[ "$CONVOYS" != "[]" ]] && [[ "$CONVOYS" != "null" ]]; then
+    while IFS= read -r convoy; do
+        CID=$(echo "$convoy" | jq -r '.id')
+        STATUS=$(echo "$convoy" | jq -r '.status')
+        COMPLETED=$(echo "$convoy" | jq -r '.completed')
+        TOTAL=$(echo "$convoy" | jq -r '.total')
+
+        if [[ "$STATUS" == "open" ]] && [[ "$COMPLETED" == "$TOTAL" ]] && [[ "$TOTAL" -gt 0 ]]; then
+            echo "  Closing: $CID ($COMPLETED/$TOTAL done)"
+            if cd "$GT" && gt convoy close "$CID" 2>&1; then
+                CLOSED=$((CLOSED + 1))
+            else
+                echo "  Failed: $CID"
+            fi
+        fi
+    done < <(echo "$CONVOYS" | jq -c '.[]')
+fi
+[[ $CLOSED -eq 0 ]] && echo "  (none)"
+
+# ── Step 8: Kill orphaned tmux sessions ──────────────────────────────────
+echo "$(TS) [8/9] Checking for orphaned tmux sessions..."
+TMUX_SESSIONS=$(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+KILLED=0
+
+if [[ -n "$TMUX_SESSIONS" ]]; then
+    # Protected sessions: mayor, overseer, and rig service sessions (refinery, witness, deacon)
+    # Rig services are not polecats and should never be killed by orphan cleanup.
+    PROTECTED="hq-mayor|hq-overseer"
+    SERVICE_SUFFIXES="refinery|witness|deacon|overseer|mayor"
+
+    # Known rig prefixes from routes
+    PREFIXES=$(cat "$GT/.beads/routes.jsonl" 2>/dev/null | jq -r '.prefix' | sed 's/-$//' | sort -u)
+
+    # Build set of live polecat session names
+    LIVE_SESSIONS=""
+    POLECAT_LIST_OK=false
+    # Re-fetch polecats (may have changed after cleanup)
+    # Capture stderr separately to detect failures without corrupting JSON stdout
+    POLECAT_ERR=$(mktemp)
+    if POLECATS=$(cd "$GT" && gt polecat list --all --json 2>"$POLECAT_ERR"); then
+        POLECAT_RC=0
+    else
+        POLECAT_RC=$?
+    fi
+    POLECAT_ERR_MSG=$(head -1 "$POLECAT_ERR" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "$POLECAT_ERR_MSG" ]]; then
+        echo "  WARNING: gt polecat list stderr: $(head -1 "$POLECAT_ERR")"
+    fi
+    rm -f "$POLECAT_ERR"
+
+    # Validate we got valid JSON before proceeding
+    if [[ $POLECAT_RC -eq 0 ]] && [[ -n "$POLECATS" ]] && echo "$POLECATS" | jq empty 2>/dev/null; then
+        POLECAT_LIST_OK=true
+        if [[ "$POLECATS" != "[]" ]] && [[ "$POLECATS" != "null" ]]; then
+            while IFS= read -r pc; do
+                [[ -z "$pc" ]] && continue
+                PC_RIG=$(echo "$pc" | jq -r '.rig' 2>/dev/null)
+                PC_NAME=$(echo "$pc" | jq -r '.name' 2>/dev/null)
+                PC_PREFIX=$(cat "$GT/.beads/routes.jsonl" 2>/dev/null | \
+                    jq -r --arg rig "$PC_RIG" 'select(.path==$rig) | .prefix' 2>/dev/null | \
+                    sed 's/-$//' | head -1)
+                if [[ -n "$PC_PREFIX" ]]; then
+                    LIVE_SESSIONS="${LIVE_SESSIONS}${PC_PREFIX}-${PC_NAME}"$'\n'
+                fi
+            done < <(echo "$POLECATS" | jq -c '.[]' 2>/dev/null || true)
+        fi
+    fi
+
+    # SAFETY: If polecat list failed, skip orphan cleanup entirely.
+    # Killing sessions based on incomplete data is worse than leaving orphans.
+    if ! $POLECAT_LIST_OK; then
+        echo "  WARNING: gt polecat list failed (rc=$POLECAT_RC), skipping orphan cleanup"
+    else
+        NOW=$(date +%s)
+        GRACE_PERIOD=120  # Don't kill sessions younger than 2 minutes
+
+        while IFS= read -r line; do
+            sess=$(echo "$line" | awk '{print $1}')
+            created=$(echo "$line" | awk '{print $2}')
+            [[ -z "$sess" ]] && continue
+
+            # Skip protected sessions
+            if [[ "$sess" =~ ^(hq-mayor|hq-overseer)$ ]]; then
+                continue
+            fi
+
+            # Skip rig service sessions (e.g., aim-refinery, aim-witness, aim-deacon)
+            if [[ "$sess" =~ -(refinery|witness|deacon|overseer|mayor)$ ]]; then
+                continue
+            fi
+
+            # Must match a GT prefix pattern
+            IS_GT=false
+            for pfx in $PREFIXES; do
+                if [[ "$sess" == "${pfx}-"* ]] || [[ "$sess" == "${pfx}" ]]; then
+                    IS_GT=true
+                    break
+                fi
+            done
+            [[ "$IS_GT" == "false" ]] && continue
+
+            # Grace period: don't kill sessions younger than GRACE_PERIOD seconds
+            if [[ -n "$created" ]] && [[ "$created" =~ ^[0-9]+$ ]]; then
+                AGE=$((NOW - created))
+                if [[ $AGE -lt $GRACE_PERIOD ]]; then
+                    echo "  Skipping young session: $sess (${AGE}s old)"
+                    continue
+                fi
+            fi
+
+            # No matching live polecat → orphaned
+            if ! echo "$LIVE_SESSIONS" | grep -qx "$sess"; then
+                echo "  Killing orphan: $sess"
+                tmux kill-session -t "$sess" 2>/dev/null || echo "  Failed: $sess"
+                KILLED=$((KILLED + 1))
+            fi
+        done <<< "$TMUX_SESSIONS"
+    fi
+fi
+[[ $KILLED -eq 0 ]] && echo "  (none)"
+
+# ── Step 9: Close system noise beads ─────────────────────────────────────
+echo "$(TS) [9/9] Closing system noise beads..."
+
+# HQ noise: title-based patterns
+HQ_NOISE='Compaction Report|Weekly Compaction|mol-deacon-patrol|ALERT: Deacon|POLECAT_DONE|WORK_DONE|DOG_TIMEOUT|Dog alpha|Deacon session dead|Health: ALL|ESCALATION:|Convoys? (auto-closed|complete)|HANDOFF: Refinery patrol|HANDOFF: Session cycling'
+
+NOISE_CLOSED=0
+ALL_NOISE_IDS=()
+
+# Collect HQ noise
+HQ_IDS=$(cd "$GT" && bd list --status=open --json --limit=0 2>/dev/null | \
+    jq -r --arg pat "$HQ_NOISE" \
+    '.[] | select(.issue_type == "agent" | not) | select((.title | test($pat)) or (.id | test("wisp-wisp"))) | .id' 2>/dev/null || true)
+while IFS= read -r nid; do
+    [[ -n "$nid" ]] && ALL_NOISE_IDS+=("$nid")
+done <<< "$HQ_IDS"
+
+# Per-rig noise: wisp molecule steps + dead patrol molecules
+# Rig noise patterns: wisp-wisp IDs (molecule steps) and patrol/refinery/deacon molecules
+RIG_NOISE_TITLES='Witness Patrol|Refinery Patrol|Deacon Patrol'
+RIGS=$(cat "$GT/.beads/routes.jsonl" 2>/dev/null | jq -r 'select(.prefix | test("^hq-") | not) | .path' | sort -u)
+
+for rig_path in $RIGS; do
+    # Extract rig name (last component of path, e.g., "workspace" from "workspace" or "rig" from "gastown/mayor/rig")
+    rig_name=$(basename "$rig_path")
+    # For nested paths like gastown/mayor/rig, use the top-level dir
+    rig_dir=$(echo "$rig_path" | cut -d/ -f1)
+
+    # Query all non-closed statuses: wisp-wisp beads from dead agents may be hooked or in_progress
+    RIG_IDS=""
+    for _status in open hooked in_progress; do
+        _IDS=$(cd "$GT" && bd list --rig "$rig_dir" --status="$_status" --json --limit=0 2>/dev/null | \
+            jq -r --arg titles "$RIG_NOISE_TITLES" '
+            .[] | select(.issue_type == "agent" | not) |
+            select(
+                (.id | test("wisp-wisp")) or
+                (.issue_type == "molecule" and (.title | test($titles)))
+            ) | .id' 2>/dev/null || true)
+        RIG_IDS="${RIG_IDS:+$RIG_IDS
+}$_IDS"
+    done
+
+    while IFS= read -r nid; do
+        [[ -n "$nid" ]] && ALL_NOISE_IDS+=("$nid")
+    done <<< "$RIG_IDS"
+done
+
+if [[ ${#ALL_NOISE_IDS[@]} -gt 0 ]]; then
+    echo "  Closing ${#ALL_NOISE_IDS[@]} noise bead(s)..."
+    cd "$GT" && bd close "${ALL_NOISE_IDS[@]}" 2>&1 || echo "  Some closes failed"
+    NOISE_CLOSED=${#ALL_NOISE_IDS[@]}
+fi
+[[ $NOISE_CLOSED -eq 0 ]] && echo "  (none)"
+
+echo "$(TS) ── gt-patrol complete ──"
