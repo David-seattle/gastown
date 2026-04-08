@@ -76,6 +76,11 @@ type SessionStartOptions struct {
 	// If set, GT_AGENT is written to the tmux session environment table so that
 	// IsAgentAlive and waitForPolecatReady read the correct process names.
 	Agent string
+
+	// PlanBeadID, when set, causes gt-pregen-plan to run in the tmux pane
+	// before the agent starts. Startup polling/nudges are skipped because
+	// only bash is running during plan generation, not the agent.
+	PlanBeadID string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -369,6 +374,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if polecatGitBranch != "" {
 		envVarsToInject["GT_BRANCH"] = polecatGitBranch
 	}
+	// Plan pre-generation: prepend gt-pregen-plan before the agent starts.
+	// Must be before PrependEnv so env vars (GT_RIG, etc.) are available.
+	if opts.PlanBeadID != "" {
+		command = "gt-pregen-plan " + config.ShellQuote(opts.PlanBeadID) + " ; " + command
+	}
 	command = config.PrependEnv(command, envVarsToInject)
 
 	// Create session with command directly to avoid send-keys race condition.
@@ -447,51 +457,56 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	agentID := fmt.Sprintf("%s/%s", m.rig.Name, polecat)
 	debugSession("SetPaneDiedHook", m.tmux.SetPaneDiedHook(sessionID, agentID))
 
-	// Wait for Claude to start (non-fatal)
-	debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
+	// Skip startup polling/nudges during plan pre-generation: only bash is
+	// running in the pane (gt-pregen-plan), not the agent. Polling for the
+	// agent prompt would time out and nudges would disrupt the bash script.
+	if opts.PlanBeadID == "" {
+		// Wait for Claude to start (non-fatal)
+		debugSession("WaitForCommand", m.tmux.WaitForCommand(sessionID, constants.SupportedShells, constants.ClaudeStartTimeout))
 
-	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
-	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
+		// Accept startup dialogs (workspace trust + bypass permissions) if they appear
+		debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
 
-	// Wait for runtime to be fully ready at the prompt (not just started).
-	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
-	// falling back to ReadyDelayMs sleep for agents without prompt detection.
-	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+		// Wait for runtime to be fully ready at the prompt (not just started).
+		// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
+		// falling back to ReadyDelayMs sleep for agents without prompt detection.
+		debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
 
-	// Handle fallback nudges for non-hook agents.
-	// See StartupFallbackInfo in runtime package for the fallback matrix.
-	if fallbackInfo.SendBeaconNudge && fallbackInfo.SendStartupNudge && fallbackInfo.StartupNudgeDelayMs == 0 {
-		// Hooks + no prompt: Single combined nudge (hook already ran gt prime synchronously)
-		combined := beacon + "\n\n" + runtime.StartupNudgeContent()
-		debugSession("SendCombinedNudge", m.tmux.NudgeSession(sessionID, combined))
-	} else {
-		if fallbackInfo.SendBeaconNudge {
-			// Agent doesn't support CLI prompt - send beacon via nudge
-			debugSession("SendBeaconNudge", m.tmux.NudgeSession(sessionID, beacon))
+		// Handle fallback nudges for non-hook agents.
+		// See StartupFallbackInfo in runtime package for the fallback matrix.
+		if fallbackInfo.SendBeaconNudge && fallbackInfo.SendStartupNudge && fallbackInfo.StartupNudgeDelayMs == 0 {
+			// Hooks + no prompt: Single combined nudge (hook already ran gt prime synchronously)
+			combined := beacon + "\n\n" + runtime.StartupNudgeContent()
+			debugSession("SendCombinedNudge", m.tmux.NudgeSession(sessionID, combined))
+		} else {
+			if fallbackInfo.SendBeaconNudge {
+				// Agent doesn't support CLI prompt - send beacon via nudge
+				debugSession("SendBeaconNudge", m.tmux.NudgeSession(sessionID, beacon))
+			}
+
+			if fallbackInfo.StartupNudgeDelayMs > 0 {
+				// Wait for agent to finish processing beacon + gt prime before sending work instructions.
+				// Uses prompt-based detection where available; falls back to max(ReadyDelayMs, StartupNudgeDelayMs).
+				primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
+				debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
+			}
+
+			if fallbackInfo.SendStartupNudge {
+				// Send work instructions via nudge
+				debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, runtime.StartupNudgeContent()))
+			}
 		}
 
-		if fallbackInfo.StartupNudgeDelayMs > 0 {
-			// Wait for agent to finish processing beacon + gt prime before sending work instructions.
-			// Uses prompt-based detection where available; falls back to max(ReadyDelayMs, StartupNudgeDelayMs).
-			primeWaitRC := runtime.RuntimeConfigWithMinDelay(runtimeConfig, fallbackInfo.StartupNudgeDelayMs)
-			debugSession("WaitForPrimeReady", m.tmux.WaitForRuntimeReady(sessionID, primeWaitRC, constants.ClaudeStartTimeout))
-		}
-
+		// Verify startup nudge was delivered: poll for idle prompt and retry if lost.
+		// This fixes the Mode B race where the nudge arrives before Claude Code is ready,
+		// causing the polecat to sit idle at an empty prompt. See GH#1379.
 		if fallbackInfo.SendStartupNudge {
-			// Send work instructions via nudge
-			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, runtime.StartupNudgeContent()))
+			m.verifyStartupNudgeDelivery(sessionID, runtimeConfig)
 		}
-	}
 
-	// Verify startup nudge was delivered: poll for idle prompt and retry if lost.
-	// This fixes the Mode B race where the nudge arrives before Claude Code is ready,
-	// causing the polecat to sit idle at an empty prompt. See GH#1379.
-	if fallbackInfo.SendStartupNudge {
-		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig)
+		// Legacy fallback for other startup paths (non-fatal)
+		_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", runtimeConfig)
 	}
-
-	// Legacy fallback for other startup paths (non-fatal)
-	_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", runtimeConfig)
 
 	// Verify session survived startup - if the command crashed, the session may have died.
 	// Without this check, Start() would return success even if the pane died during initialization.
@@ -572,13 +587,14 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	return nil
 }
 
-// IsRunning checks if a polecat session is active and healthy.
-// Checks both tmux session existence AND agent process liveness to avoid
-// reporting zombie sessions (tmux alive but Claude dead) as "running".
+// IsRunning checks if a polecat session exists in tmux.
+// Uses HasSession (tmux liveness) instead of CheckSessionHealth (agent process
+// liveness) so that polecats in the plan pre-generation phase — where only bash
+// is running, not the agent — are not falsely classified as dead and nuked.
+// Zombie detection is handled separately by gt-patrol's polecat-recover.
 func (m *SessionManager) IsRunning(polecat string) (bool, error) {
 	sessionID := m.SessionName(polecat)
-	status := m.tmux.CheckSessionHealth(sessionID, 0)
-	return status == tmux.SessionHealthy, nil
+	return m.tmux.HasSession(sessionID)
 }
 
 // Status returns detailed status for a polecat session.

@@ -202,9 +202,32 @@ Empty setup_command means "not configured" — skip this step.
 **Exit criteria:** You're on a clean feature branch, rebased on latest {{base_branch}}, dependencies installed."""
 
 [[steps]]
+id = "plan"
+title = "Read pre-generated plan"
+needs = ["branch-setup"]
+description = """
+Read the implementation plan that was generated during polecat setup.
+
+```bash
+ws plan list {{issue}}
+ws plan show <plan-name>
+```
+
+Review the plan — understand the approach before implementing.
+
+If no plan was linked (setup failure), proceed using issue requirements:
+```bash
+bd show {{issue}}
+ws show {{issue}} functional
+ws show {{issue}} technical-design
+```
+
+**Exit criteria:** Plan reviewed, ready to implement."""
+
+[[steps]]
 id = "implement"
 title = "Implement the solution"
-needs = ["branch-setup"]
+needs = ["plan"]
 description = """
 Do the actual implementation work.
 

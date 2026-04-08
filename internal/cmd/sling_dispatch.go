@@ -378,7 +378,10 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		updateAgentMode(targetAgent, params.Mode, hookWorkDir, beadsDir)
 	}
 
-	// 11. Start polecat session
+	// 11. Start polecat session (with plan pre-generation for eligible bead types)
+	if needsPlan(info.IssueType) {
+		spawnInfo.PlanBeadID = params.BeadID
+	}
 	pane, err := spawnInfo.StartSession()
 	if err != nil {
 		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
@@ -391,6 +394,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 
 	result.Success = true
 	return result, nil
+}
+
+// needsPlan returns true for bead types that benefit from pre-generated plans.
+func needsPlan(issueType string) bool {
+	switch issueType {
+	case "feature", "bug", "task":
+		return true
+	default:
+		return false
+	}
 }
 
 // findTownRoot is defined in hook.go

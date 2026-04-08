@@ -1,0 +1,164 @@
+#!/bin/bash
+# generate-plan — run Claude Code plan mode and return the plan file path.
+#
+# Usage:
+#   generate-plan <task-file>
+#   generate-plan <task-file> --print
+#   echo "task description" | generate-plan -
+#
+# Assembles a prompt from the task description + an embedded plan template,
+# runs plan mode with workspace tool access, and outputs the plan file path.
+# Use --print to also cat the plan contents.
+#
+# The task description should include the work item ID (e.g., EN-1234) so that
+# the workspace tool can record decisions and questions.
+#
+# Requires:
+#   - claude CLI
+#   - ~/bin/claude-session-env hook (PID→session mapping)
+
+set -euo pipefail
+
+WS="ws"  # On PATH via ~/bin/ws symlink
+PRINT_PLAN=false
+
+usage() {
+  echo "Usage: generate-plan <task-file> [--print]" >&2
+  echo "       echo \"task\" | generate-plan - [--print]" >&2
+  exit 1
+}
+
+# Parse args
+TASK_FILE=""
+for arg in "$@"; do
+  case "$arg" in
+    --print) PRINT_PLAN=true ;;
+    -h|--help) usage ;;
+    *) TASK_FILE="$arg" ;;
+  esac
+done
+
+[ -z "$TASK_FILE" ] && usage
+
+# Assemble prompt: task description + embedded plan template
+PROMPT_FILE=$(mktemp)
+trap 'rm -f "$PROMPT_FILE"' EXIT
+
+if [ "$TASK_FILE" = "-" ]; then
+  cat > "$PROMPT_FILE"
+else
+  [ ! -f "$TASK_FILE" ] && echo "File not found: $TASK_FILE" >&2 && exit 1
+  cat "$TASK_FILE" > "$PROMPT_FILE"
+fi
+
+cat >> "$PROMPT_FILE" << 'TEMPLATE'
+
+Do NOT ask clarifying questions or wait for input. When you face a design choice, make a decision and document it. When something should be validated by a human, document it as a question with your default choice. You must complete everything in this session.
+
+## Plan Format
+
+Your plan MUST include ALL of these sections:
+- Context, Files to Change, Implementation Details, Verification Steps
+
+### Decisions Section (REQUIRED)
+Include a `## Decisions` section. For EACH non-obvious design choice, add:
+
+### D: <slug>
+- **Context:** Why this decision was needed
+- **Decision:** What you chose
+- **Alternatives:** Other options considered and why rejected
+- **Risks:** Any risks with this choice
+- **Reversibility:** one-way-door | two-way-door
+
+### Questions Section (REQUIRED)
+Include a `## Questions` section. For things a human should validate:
+
+### Q: <slug>
+- **Question:** The specific question
+- **Context:** Why it matters
+- **Default choice:** What you went with and why
+- **Impact:** What changes if the answer is different
+
+## CRITICAL: Document Decisions Before Writing the Plan
+
+BEFORE you write the plan file, use Bash to record each decision and question with the workspace tool.
+
+The ws tool: ws (on PATH)
+
+For each decision:
+1. ws new <WORK-ITEM> <slug> d  (creates and shows template)
+2. ws edit <WORK-ITEM> <slug> --old "<template text>" --new "<filled text>"
+
+For each question:
+1. ws new <WORK-ITEM> <slug> q  (creates and shows template)
+2. ws edit <WORK-ITEM> <slug> --old "<template text>" --new "<filled text>"
+
+The order MUST be: explore codebase → create ws entries → write plan file.
+
+Do NOT use plan mode tools. Just write the plan file and stop.
+TEMPLATE
+
+# Run plan mode and capture JSON output to get session_id directly.
+# --mcp-config disables MCP servers (they'd keep the process alive after completion).
+# No plan mode tools — the nested claude just writes a file and exits.
+# Strip ALL GT_* vars so the nested claude doesn't inherit polecat identity.
+# Without this, the polecat stop guard blocks the nested session from exiting,
+# causing the pregen phase to hang and eventually kill the polecat session.
+CLEAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT)
+while IFS='=' read -r key _; do
+  CLEAN_ENV+=(-u "$key")
+done < <(env | grep "^GT_")
+
+CLAUDE_OUTPUT=$("${CLEAN_ENV[@]}" claude -p \
+  --allowed-tools "Bash,Read,Glob,Grep,Write" \
+  --mcp-config '{"mcpServers":{}}' --strict-mcp-config \
+  --output-format json \
+  < "$PROMPT_FILE") || {
+  echo "Plan mode failed" >&2
+  exit 1
+}
+
+SESSION_ID=$(echo "$CLAUDE_OUTPUT" | jq -r '.session_id // empty')
+if [ -z "$SESSION_ID" ]; then
+  echo "No session_id in claude output" >&2
+  exit 1
+fi
+
+# Find the plan file via session slug from transcript.
+CLAUDE_PLANS_DIR="$HOME/.claude/plans"
+PLAN_FILE=""
+
+TRANSCRIPT=$(find "$HOME/.claude/projects" -name "${SESSION_ID}.jsonl" -not -path "*/subagents/*" 2>/dev/null | head -1)
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  SLUG=$(grep -m1 '"slug"' "$TRANSCRIPT" | grep -o '"slug":"[^"]*"' | sed 's/"slug":"//;s/"$//')
+  if [ -n "$SLUG" ] && [ -f "$CLAUDE_PLANS_DIR/${SLUG}.md" ]; then
+    PLAN_FILE="$CLAUDE_PLANS_DIR/${SLUG}.md"
+  fi
+fi
+
+# Fallback 1: extract Write tool file_path from transcript (Claude may write
+# to cwd instead of ~/.claude/plans/ when plan mode tools are disabled)
+if [ -z "$PLAN_FILE" ] && [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  WRITE_PATH=$(grep '"Write"' "$TRANSCRIPT" | grep -o '"file_path":"[^"]*"' | tail -1 | sed 's/"file_path":"//;s/"$//')
+  if [ -n "$WRITE_PATH" ] && [ -f "$WRITE_PATH" ]; then
+    PLAN_FILE="$WRITE_PATH"
+  fi
+fi
+
+# Fallback 2: most recent plan file modified during our run
+if [ -z "$PLAN_FILE" ]; then
+  PLAN_FILE=$(find "$CLAUDE_PLANS_DIR" -name "*.md" -newer "$PROMPT_FILE" 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+fi
+
+if [ -z "$PLAN_FILE" ]; then
+  echo "No plan file found for session $SESSION_ID" >&2
+  exit 1
+fi
+
+# Output
+echo "$PLAN_FILE"
+
+if [ "$PRINT_PLAN" = true ]; then
+  echo "---"
+  cat "$PLAN_FILE"
+fi
