@@ -250,7 +250,17 @@ func TestCopyFilePreserveMode_NonexistentSource(t *testing.T) {
 	}
 }
 
+// disableGlobalGitignore overrides the global gitignore reader to return empty,
+// isolating tests from the real global gitignore.
+func disableGlobalGitignore(t *testing.T) {
+	t.Helper()
+	orig := readGlobalGitignoreFn
+	readGlobalGitignoreFn = func() string { return "" }
+	t.Cleanup(func() { readGlobalGitignoreFn = orig })
+}
+
 func TestEnsureGitignorePatterns_CreatesNewFile(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	err := EnsureGitignorePatterns(tmpDir)
@@ -273,6 +283,7 @@ func TestEnsureGitignorePatterns_CreatesNewFile(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_AppendsToExisting(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Create existing .gitignore with some content
@@ -311,6 +322,7 @@ func TestEnsureGitignorePatterns_AppendsToExisting(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_SkipsExistingPatterns(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Create existing .gitignore with some Gas Town patterns already.
@@ -364,6 +376,7 @@ func TestEnsureGitignorePatterns_SkipsExistingPatterns(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_RecognizesVariants(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Create existing .gitignore with variant patterns (without trailing slash).
@@ -397,6 +410,7 @@ func TestEnsureGitignorePatterns_RecognizesVariants(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_AllPatternsPresent(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Create existing .gitignore with all required patterns.
@@ -427,6 +441,7 @@ func TestEnsureGitignorePatterns_AllPatternsPresent(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_NarrowPatternPresent(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Create .gitignore with the exact required patterns
@@ -452,6 +467,7 @@ func TestEnsureGitignorePatterns_NarrowPatternPresent(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_OldNarrowClaudeUpgraded(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Simulate old installation with narrow .claude/commands/ pattern.
@@ -484,6 +500,7 @@ func TestEnsureGitignorePatterns_OldNarrowClaudeUpgraded(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_UpgradePreservesBroadPattern(t *testing.T) {
+	disableGlobalGitignore(t)
 	tmpDir := t.TempDir()
 
 	// Simulate an existing installation that has .claude/ plus other Gas Town
@@ -540,6 +557,80 @@ func TestGasTownLocalExcludePatterns_IncludesBeads(t *testing.T) {
 		if p == ".beads/" {
 			t.Error("gasTownIgnorePatterns() must NOT include .beads/ - that breaks bd sync (see overlay.go)")
 		}
+	}
+}
+
+func TestEnsureGitignorePatterns_RespectsGlobalGitignore(t *testing.T) {
+	// Mock the global gitignore to contain all required patterns
+	orig := readGlobalGitignoreFn
+	readGlobalGitignoreFn = func() string {
+		return ".runtime/\n.claude/\n.logs/\n__pycache__/\nstate.json\nCLAUDE.md\nCLAUDE.local.md\n"
+	}
+	t.Cleanup(func() { readGlobalGitignoreFn = orig })
+
+	tmpDir := t.TempDir()
+	existing := "node_modules/\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte(existing), 0644); err != nil {
+		t.Fatalf("Failed to create .gitignore: %v", err)
+	}
+
+	err := EnsureGitignorePatterns(tmpDir)
+	if err != nil {
+		t.Fatalf("EnsureGitignorePatterns() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("Failed to read .gitignore: %v", err)
+	}
+
+	// File should be unchanged — global gitignore covers all patterns
+	if string(content) != existing {
+		t.Errorf("File was modified when global gitignore covers all patterns.\nGot: %q\nWant: %q", string(content), existing)
+	}
+}
+
+func TestEnsureGitignorePatterns_GlobalCoversPartial(t *testing.T) {
+	// Mock the global gitignore to cover only some patterns
+	orig := readGlobalGitignoreFn
+	readGlobalGitignoreFn = func() string {
+		return ".runtime/\n.claude/\n"
+	}
+	t.Cleanup(func() { readGlobalGitignoreFn = orig })
+
+	tmpDir := t.TempDir()
+	existing := "node_modules/\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte(existing), 0644); err != nil {
+		t.Fatalf("Failed to create .gitignore: %v", err)
+	}
+
+	err := EnsureGitignorePatterns(tmpDir)
+	if err != nil {
+		t.Fatalf("EnsureGitignorePatterns() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("Failed to read .gitignore: %v", err)
+	}
+
+	// .runtime/ and .claude/ are in global, so should NOT be added locally
+	if containsLine(string(content), ".runtime/") {
+		t.Error(".runtime/ should not be added when global gitignore covers it")
+	}
+	if containsLine(string(content), ".claude/") {
+		t.Error(".claude/ should not be added when global gitignore covers it")
+	}
+
+	// Other patterns are NOT in global, so should be added
+	if !containsLine(string(content), ".logs/") {
+		t.Error(".logs/ should be added (not in global gitignore)")
+	}
+	if !containsLine(string(content), "__pycache__/") {
+		t.Error("__pycache__/ should be added (not in global gitignore)")
+	}
+	if !containsLine(string(content), "state.json") {
+		t.Error("state.json should be added (not in global gitignore)")
 	}
 }
 

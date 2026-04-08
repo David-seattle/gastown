@@ -597,6 +597,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			// Rebase onto latest main to avoid push failures when main has advanced
+			if fetchErr := g.FetchBranch("origin", defaultBranch); fetchErr != nil {
+				style.PrintWarning("fetch %s failed: %v", defaultBranch, fetchErr)
+			} else if rebaseErr := g.Rebase("origin/" + defaultBranch); rebaseErr != nil {
+				pushFailed = true
+				errMsg := fmt.Sprintf("rebase onto %s failed: %v", defaultBranch, rebaseErr)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s", errMsg)
+				_ = g.AbortRebase()
+				goto notifyWitness
+			}
 			// Push submodule changes before direct push (gt-dzs)
 			pushSubmoduleChanges(g, defaultBranch)
 			directRefspec := branch + ":" + defaultBranch
@@ -872,6 +883,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+
+			// Rebase onto latest main to avoid push failures when main has advanced
+			if fetchErr := g.FetchBranch("origin", defaultBranch); fetchErr != nil {
+				style.PrintWarning("fetch %s failed: %v", defaultBranch, fetchErr)
+			} else if rebaseErr := g.Rebase("origin/" + defaultBranch); rebaseErr != nil {
+				style.PrintWarning("late rebase onto %s failed: %v — falling through to MR", defaultBranch, rebaseErr)
+				_ = g.AbortRebase()
+			}
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
 			directRefspec := branch + ":" + defaultBranch
