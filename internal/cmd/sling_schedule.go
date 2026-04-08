@@ -174,6 +174,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		fields.Agent = opts.Agent
 	}
 	fields.HookRawBead = opts.HookRawBead
+	fields.Force = opts.Force
 	if opts.Ralph {
 		fields.Mode = "ralph"
 	}
