@@ -5,6 +5,17 @@ This molecule guides a polecat through a complete work assignment. Each step
 has clear entry/exit criteria and specific commands to run. A polecat can
 crash after any step and resume from the last completed step.
 
+## CRITICAL: Do NOT Use Plan Mode
+
+Do NOT call EnterPlanMode or ExitPlanMode. Plan mode blocks your session and
+prevents other tools from running. If you need to plan your approach, write a
+markdown file or think it through in context and proceed directly to
+implementation. Never:
+- Call EnterPlanMode or ExitPlanMode
+- Write files to ~/.claude/plans/
+- Spawn Plan-type subagents (use Explore instead)
+- Wait for "plan approval"
+
 ## Polecat Contract (Self-Cleaning Model)
 
 You are a self-cleaning worker. You:
@@ -52,7 +63,7 @@ stale, the refinery falls through to normal gate execution.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
-version = 10
+version = 11
 
 [[steps]]
 id = "load-context"
@@ -361,12 +372,76 @@ git diff --stat origin/{{base_branch}}...HEAD
 If you accidentally modified unrelated files, remove those changes.
 
 **Exit criteria:** Changes are clean, reviewed (Grade B or better if using /review),
-and ready for build check."""
+and ready for code review."""
+
+[[steps]]
+id = "code-review"
+title = "Self-review your changes"
+needs = ["self-review"]
+description = """
+Review your diff from a fresh perspective, as if reviewing someone else's code.
+
+**1. Review the full diff:**
+```bash
+git diff origin/{{base_branch}}...HEAD
+```
+
+**2. For each changed file, check for:**
+
+| Category | Look For |
+|----------|----------|
+| Bugs | Logic errors, nil derefs, off-by-one, missing returns |
+| Security | Injection, auth bypass, exposed secrets, hardcoded creds |
+| Performance | N+1 queries, unbounded loops, missing indexes |
+| Error handling | Swallowed errors, missing validation at boundaries |
+| Tests | Missing test cases, edge cases not covered |
+
+**3. Fix any issues found.** Commit fixes separately:
+```bash
+git add <files> && git commit -m "fix: <what you fixed> ({{issue}})"
+```
+
+**Exit criteria:** All changed files reviewed for correctness, security, and quality."""
+
+[[steps]]
+id = "acceptance-check"
+title = "Verify acceptance criteria"
+needs = ["code-review"]
+description = """
+Review the acceptance criteria and verify each criterion is met.
+
+**1. Read the acceptance criteria:**
+```bash
+ws show {{issue}} acceptance-criteria
+```
+
+If no acceptance criteria doc exists, check the bead description:
+```bash
+bd show {{issue}}
+```
+
+**2. For each acceptance criterion, verify:**
+- Is it implemented?
+- Is it tested (if applicable)?
+- Does it match the expected behavior described?
+
+**3. If any criterion is NOT met:**
+- Go back to the implement step and address it
+- Do NOT proceed with unmet acceptance criteria
+
+**4. If acceptance criteria are vague or missing:**
+- Use your best judgment based on the issue description
+- Note any ambiguities in the bead:
+```bash
+bd update {{issue}} --notes "AC ambiguity: <what was unclear and how you interpreted it>"
+```
+
+**Exit criteria:** All acceptance criteria verified as met, or ambiguities documented."""
 
 [[steps]]
 id = "build-check"
 title = "Build and sanity check"
-needs = ["self-review"]
+needs = ["acceptance-check"]
 description = """
 Verify your changes compile and pass basic sanity checks. The Refinery's
 bisecting merge queue runs the full test suite — your job is to catch
