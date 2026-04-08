@@ -173,10 +173,10 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		return 0, fmt.Errorf("dispatch cycle failed: %w", err)
 	}
 
-	// Wake rig agents for each unique rig that had successful dispatches.
-	for rig := range successfulRigs {
-		wakeRigAgents(rig)
-	}
+	// Skip wakeRigAgents — rig boot starts witness/refinery/factory sessions
+	// which are not wanted when using shell-script-based maintenance (gt-patrol).
+	// Polecats are already spawned with NoBoot=true above.
+	_ = successfulRigs
 
 	// Update runtime state with fresh read to avoid clobbering concurrent pause.
 	if report.Dispatched > 0 {
