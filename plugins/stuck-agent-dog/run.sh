@@ -86,41 +86,11 @@ done <<< "$RIG_PREFIX_MAP"
 log ""
 log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
 
-# --- Check deacon health -----------------------------------------------------
+# --- Deacon check removed ----------------------------------------------------
+# Deacon is permanently disabled in this fork (gt-patrol handles maintenance).
+# No session to check.
 
-log ""
-log "=== Deacon Health ==="
-
-DEACON_SESSION="hq-deacon"
 DEACON_ISSUE=""
-
-if ! tmux has-session -t "$DEACON_SESSION" 2>/dev/null; then
-  log "  CRASHED: Deacon session is dead"
-  DEACON_ISSUE="crashed"
-else
-  DEACON_PID=$(tmux list-panes -t "$DEACON_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
-  DEACON_COMM=$(ps -o comm= -p "$DEACON_PID" 2>/dev/null)
-  if [ -z "$DEACON_COMM" ]; then
-    log "  ZOMBIE: Deacon process dead (pid=$DEACON_PID), session alive"
-    DEACON_ISSUE="zombie"
-  else
-    log "  Process alive: pid=$DEACON_PID comm=$DEACON_COMM"
-  fi
-
-  HEARTBEAT_FILE="$TOWN_ROOT/deacon/heartbeat.json"
-  if [ -f "$HEARTBEAT_FILE" ]; then
-    HEARTBEAT_TIME=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null)
-    NOW=$(date +%s)
-    HEARTBEAT_AGE=$(( NOW - HEARTBEAT_TIME ))
-
-    if [ "$HEARTBEAT_AGE" -gt 1200 ]; then
-      log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, >20m threshold)"
-      DEACON_ISSUE="stuck_heartbeat_${HEARTBEAT_AGE}s"
-    else
-      log "  OK: Deacon heartbeat ${HEARTBEAT_AGE}s old"
-    fi
-  fi
-fi
 
 # --- Mass death check ---------------------------------------------------------
 
