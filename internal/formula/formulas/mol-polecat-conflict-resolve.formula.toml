@@ -300,12 +300,17 @@ This completes the MR that was blocked on conflicts.
 
 **2. Close the source issue (if not already closed):**
 ```bash
-bd show <source-issue>      # Check status
+bd show <source-issue> --json   # Check current status first
+```
+
+If the source issue is already closed, skip to step 3. Otherwise:
+```bash
 bd close <source-issue> --reason="merged via conflict resolution"
 ```
 
 The Refinery normally closes issues after merge, but since we pushed
-directly to {{base_branch}}, we handle it here.
+directly to {{base_branch}}, we handle it here. The source may already
+be closed if the drain cleaned up the orphaned MR before you finished.
 
 **3. Sync beads:**
 ```bash

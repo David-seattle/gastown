@@ -275,6 +275,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 				fmt.Printf("  %s Created convoy %s\n", style.Bold.Render("→"), convoyID)
 			}
 		} else {
+			convoyID = existingConvoy
 			fmt.Printf("  %s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
 		}
 	}
@@ -362,7 +363,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// 9. Update agent hook_bead state
 	updateAgentHookBead(targetAgent, beadToHook, hookWorkDir, beadsDir)
 
-	// 10. Store fields in bead (dispatcher, args, attached_molecule, no_merge, mode)
+	// 10. Store fields in bead (dispatcher, args, attached_molecule, no_merge, mode, convoy)
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             params.Args,
@@ -372,6 +373,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		NoMerge:          params.NoMerge,
 		ReviewOnly:       params.ReviewOnly,
 		Mode:             params.Mode,
+		ConvoyID:         convoyID,
+		MergeStrategy:    params.Merge,
+		ConvoyOwned:      params.Owned,
 		FormulaVars:      strings.Join(allVars, "\n"),
 	}
 	// Use beadToHook for the update target (may differ from beadID when formula-on-bead)

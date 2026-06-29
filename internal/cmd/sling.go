@@ -871,6 +871,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 				}
 			}
 		} else {
+			convoyID = existingConvoy
 			fmt.Printf("%s Already tracked by convoy %s\n", style.Dim.Render("○"), existingConvoy)
 		}
 	}

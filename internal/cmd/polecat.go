@@ -1846,6 +1846,19 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		branchToDelete = polecatInfo.Branch
 	}
 
+	// Step 2.1: Cache merge strategy BEFORE nukeCleanupMolecules (step 2.5).
+	// DetachMoleculeWithAudit calls SetAttachmentFields(issue, nil), which wipes
+	// ALL attachment fields including merge_strategy. Steps 2.75 and 4 need the
+	// merge strategy to decide whether to push/preserve the branch — reading after
+	// detach returns nothing, causing local-strategy branches to be pushed and deleted.
+	var cachedMergeStrategy string
+	if getErr == nil && polecatInfo != nil && polecatInfo.Issue != "" {
+		nukeBd := beads.New(nukeResolveBeadsWorkDir(polecatInfo.Issue, r))
+		if issue, err := nukeBd.Show(polecatInfo.Issue); err == nil {
+			cachedMergeStrategy = nukeMergeStrategyFromIssue(issue)
+		}
+	}
+
 	// Step 2.5: Burn any molecule attached to the polecat's hooked work bead.
 	// Without this, nuked polecats leave orphan molecule refs that block re-sling.
 	// The stale attached_molecule in the work bead's description causes sling to
@@ -1857,7 +1870,12 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	// Step 2.75: Best-effort push before nuke (gt-4vr guardrail).
 	// Try to preserve any unpushed commits on the branch. If push fails,
 	// proceed — --force already means "I accept data loss".
-	if branchToDelete != "" {
+	// Skip for local merge strategy: the branch stays local only, no remote push.
+	// Uses cachedMergeStrategy from step 2.1 (attachment fields are gone after step 2.5).
+	if cachedMergeStrategy == "local" {
+		fmt.Printf("  %s skipped best-effort push (merge_strategy=local)\n", style.Dim.Render("○"))
+	}
+	if branchToDelete != "" && cachedMergeStrategy != "local" {
 		var pushGit *git.Git
 		// Try worktree first (may still exist), then bare repo fallback.
 		// Use ClonePath from the polecat record — the worktree lives at
@@ -1901,12 +1919,18 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	// remote branch cleanup after successful merge (gt mq post-merge).
 	// This prevents the race where nuke deletes the branch before the
 	// refinery has a chance to merge it. (gt-v5ku)
+	// Exception: local merge strategy — the local branch is the only copy
+	// of work (gt done skipped push), so preserve it for human review.
 	if branchToDelete != "" {
-		repoGit := getRepoGitForRig(r.Path)
-		if err := repoGit.DeleteBranch(branchToDelete, true); err != nil {
-			fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
+		if cachedMergeStrategy == "local" {
+			fmt.Printf("  %s skipped local branch delete (merge_strategy=local, for human review)\n", style.Dim.Render("○"))
 		} else {
-			fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
+			repoGit := getRepoGitForRig(r.Path)
+			if err := repoGit.DeleteBranch(branchToDelete, true); err != nil {
+				fmt.Printf("  %s branch delete: %v\n", style.Dim.Render("○"), err)
+			} else {
+				fmt.Printf("  %s deleted local branch %s\n", style.Success.Render("✓"), branchToDelete)
+			}
 		}
 		fmt.Printf("  %s remote branch preserved for refinery merge\n", style.Dim.Render("○"))
 	}
@@ -1931,15 +1955,33 @@ func resetPolecatAgentBeadForReuse(r *rig.Rig, rigName, polecatName string) {
 	}
 }
 
+// nukeMergeStrategyFromIssue extracts the merge_strategy from a bead's attachment fields.
+// Returns empty string if issue is nil or has no attachment fields.
+func nukeMergeStrategyFromIssue(issue *beads.Issue) string {
+	if issue == nil {
+		return ""
+	}
+	fields := beads.ParseAttachmentFields(issue)
+	if fields == nil {
+		return ""
+	}
+	return fields.MergeStrategy
+}
+
+// nukeResolveBeadsWorkDir returns the correct beads working directory for a work bead
+// during polecat nuke. Uses prefix-based routing via routes.jsonl so that beads from
+// any rig (e.g., suplari_assistant, cleansing) resolve to the correct .beads/ directory,
+// not just the hardcoded mayor/rig path which fails for rigs without metadata.json there.
+func nukeResolveBeadsWorkDir(workBeadID string, r *rig.Rig) string {
+	townRoot := filepath.Dir(r.Path)
+	return beads.ResolveHookDir(townRoot, workBeadID, r.Path)
+}
+
 // nukeCleanupMolecules burns any molecule attached to a work bead during polecat nuke.
 // This prevents stale attached_molecule references from blocking re-dispatch (gt-npzy).
 // Best-effort: failures are logged but don't abort the nuke.
 func nukeCleanupMolecules(workBeadID string, r *rig.Rig) {
-	// Use mayor/rig as workDir so ResolveBeadsDir finds the Dolt-backed
-	// .beads/ directory, not the gitignored rig-root .beads/. Without this,
-	// detach/close operations route to the wrong database and the stale
-	// molecule attachment persists on the work bead. (gt--1up)
-	bd := beads.New(filepath.Join(r.Path, "mayor", "rig"))
+	bd := beads.New(nukeResolveBeadsWorkDir(workBeadID, r))
 
 	// Fetch the work bead to check for attached molecules
 	issue, err := bd.Show(workBeadID)
