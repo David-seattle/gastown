@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stuck-agent-dog/run.sh — Context-aware stuck/crashed agent detection.
 #
-# SCOPE: Only polecats and deacon. NEVER touches crew, mayor, witness, or refinery.
+# SCOPE: Only polecats. NEVER touches crew, mayor, witness, or refinery.
 # The daemon detects; this plugin inspects context before acting.
 
 set -euo pipefail
@@ -10,44 +10,6 @@ TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
 RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
 
 log() { echo "[stuck-agent-dog] $*"; }
-
-heartbeat_epoch() {
-  local file="$1"
-  local ts=""
-
-  ts=$(jq -r '(.timestamp // empty) | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // empty' "$file" 2>/dev/null || true)
-  if [ -n "$ts" ]; then
-    echo "$ts"
-    return 0
-  fi
-
-  # Fallback for malformed legacy files: use mtime rather than failing open.
-  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null
-}
-
-has_in_progress_work() {
-  local locations=("$TOWN_ROOT")
-  local rig=""
-  local prefix=""
-  local loc=""
-  local output=""
-  local count=""
-
-  while IFS='|' read -r rig prefix; do
-    [ -z "$rig" ] && continue
-    [ -d "$TOWN_ROOT/$rig" ] && locations+=("$TOWN_ROOT/$rig")
-  done <<< "$RIG_PREFIX_MAP"
-
-  for loc in "${locations[@]}"; do
-    output=$(cd "$loc" && bd list --status=in_progress --json --limit=1 2>/dev/null) || return 0
-    count=$(printf '%s' "$output" | jq 'length' 2>/dev/null || echo 1)
-    if [ "${count:-1}" -gt 0 ]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
 
 # --- Enumerate agents ---------------------------------------------------------
 
@@ -124,47 +86,9 @@ done <<< "$RIG_PREFIX_MAP"
 log ""
 log "Polecat health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
 
-# --- Check deacon health -----------------------------------------------------
-
-log ""
-log "=== Deacon Health ==="
-
-DEACON_SESSION="hq-deacon"
-DEACON_ISSUE=""
-DEACON_PROCESS_ALIVE=0
-
-if ! tmux has-session -t "$DEACON_SESSION" 2>/dev/null; then
-  log "  CRASHED: Deacon session is dead"
-  DEACON_ISSUE="crashed"
-else
-  DEACON_PID=$(tmux list-panes -t "$DEACON_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)
-  DEACON_COMM=$(ps -o comm= -p "$DEACON_PID" 2>/dev/null)
-  if [ -z "$DEACON_COMM" ]; then
-    log "  ZOMBIE: Deacon process dead (pid=$DEACON_PID), session alive"
-    DEACON_ISSUE="zombie"
-  else
-    log "  Process alive: pid=$DEACON_PID comm=$DEACON_COMM"
-    DEACON_PROCESS_ALIVE=1
-  fi
-
-  HEARTBEAT_FILE="$TOWN_ROOT/deacon/heartbeat.json"
-  if [ -z "$DEACON_ISSUE" ] && [ -f "$HEARTBEAT_FILE" ]; then
-    HEARTBEAT_TIME=$(heartbeat_epoch "$HEARTBEAT_FILE" || true)
-    NOW=$(date +%s)
-    HEARTBEAT_AGE=$(( NOW - ${HEARTBEAT_TIME:-0} ))
-
-    if [ "$HEARTBEAT_AGE" -gt 1200 ]; then
-      if [ "$DEACON_PROCESS_ALIVE" -eq 1 ] && ! has_in_progress_work; then
-        log "  SKIP: Deacon heartbeat stale (${HEARTBEAT_AGE}s old) but process is alive and no in_progress work exists"
-      else
-        log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, >20m threshold)"
-        DEACON_ISSUE="stuck_heartbeat_${HEARTBEAT_AGE}s"
-      fi
-    else
-      log "  OK: Deacon heartbeat ${HEARTBEAT_AGE}s old"
-    fi
-  fi
-fi
+# --- Deacon check removed ----------------------------------------------------
+# Deacon is permanently disabled in this fork (gt-patrol handles maintenance).
+# No session to check.
 
 # --- Mass death check ---------------------------------------------------------
 
@@ -205,27 +129,9 @@ action: restart requested
 BODY
 done
 
-# Deacon issues: escalate
-if [ -n "$DEACON_ISSUE" ]; then
-	log "Escalating deacon issue: $DEACON_ISSUE"
-	DEACON_SEVERITY="HIGH"
-	DEACON_FINGERPRINT="stuck-agent-dog:deacon:$DEACON_ISSUE"
-	case "$DEACON_ISSUE" in
-		stuck_heartbeat_*)
-			DEACON_SEVERITY="MEDIUM"
-			DEACON_FINGERPRINT="stuck-agent-dog:deacon:stuck-heartbeat"
-			;;
-	esac
-	gt escalate "Deacon $DEACON_ISSUE detected by stuck-agent-dog" \
-		-s "$DEACON_SEVERITY" \
-		--source "plugin:stuck-agent-dog" \
-		--fingerprint "$DEACON_FINGERPRINT" 2>/dev/null || true
-fi
-
 # --- Report -------------------------------------------------------------------
 
 SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
-[ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
 log ""
 log "=== $SUMMARY ==="
 
