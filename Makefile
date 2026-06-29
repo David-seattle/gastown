@@ -113,15 +113,14 @@ install: check-up-to-date build
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
 	@$(MAKE) --no-print-directory check-install-path
-	@# Restart daemon so it picks up the new binary.
-	@# A stale daemon is a recurring source of bugs (wrong session prefixes, etc.)
+	@# This fork keeps the daemon permanently OFF (gt-patrol handles all
+	@# maintenance via launchd). The upstream install target restarts the daemon
+	@# here, which silently revives it — burning tokens via deacon/dog AI sessions
+	@# and emitting false "deacon crashed" escalations. Do NOT start the daemon.
+	@# If a daemon is somehow running, stop it rather than restart it.
 	@if $(INSTALL_DIR)/$(BINARY) daemon status >/dev/null 2>&1; then \
-		echo "Restarting daemon to pick up new binary..."; \
+		echo "Daemon is running — stopping it (this fork runs daemon-off)..."; \
 		$(INSTALL_DIR)/$(BINARY) daemon stop >/dev/null 2>&1 || true; \
-		sleep 1; \
-		$(INSTALL_DIR)/$(BINARY) daemon start >/dev/null 2>&1 && \
-			echo "Daemon restarted." || \
-			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
 	@# Sync plugins from build repo to town runtime directories.
 	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
