@@ -214,7 +214,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			}
 		}
 
-		if opts.BeadID != "" && !opts.Force {
+		if opts.BeadID != "" {
 			if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 				return nil, err
 			}
@@ -262,7 +262,7 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 	agentID, pane, workDir, err := resolveTargetAgentFn(target)
 	if err != nil {
 		if rigName, ok := missingPolecatTargetRig(target, opts.Create, opts.TownRoot); ok {
-			if opts.BeadID != "" && !opts.Force {
+			if opts.BeadID != "" {
 				if err := checkCrossRigGuard(opts.BeadID, rigName+"/polecats/_", opts.TownRoot); err != nil {
 					return nil, err
 				}

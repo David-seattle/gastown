@@ -165,6 +165,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
 	}
 
+	// Guard against slinging bugs/features without workspace requirements.
+	// INTENTIONALLY not gated on --force. Requirements are non-negotiable for
+	// bugs/features. If you think you need --force here, the bead type is wrong.
+	if err := checkWorkspaceRequirements(params.BeadID, info.IssueType); err != nil {
+		result.ErrMsg = "missing requirements"
+		return result, err
+	}
+
 	if params.RigName != "" {
 		if err := verifyBeadExistsInTargetRigDatabase(params.BeadID, params.RigName, townRoot); err != nil {
 			result.ErrMsg = err.Error()
