@@ -1411,7 +1411,7 @@ notifyWitness:
 	}
 
 	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID)
 
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
@@ -1749,6 +1749,19 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 	}
 }
 
+// shouldCloseHookedBead determines whether gt done should close the source
+// bead. Returns false for ESCALATED (bead stays open for recovery) and when
+// an MR was created (refinery will close after merge).
+func shouldCloseHookedBead(mrID, exitType string) bool {
+	if exitType == ExitEscalated {
+		return false
+	}
+	if mrID != "" {
+		return false
+	}
+	return true
+}
+
 // updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
@@ -1762,7 +1775,7 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID, mrID string) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -1848,7 +1861,17 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 		// DEFERRED exits preserve the bead: work is paused, not done. The bead
 		// stays open/in_progress so it can be resumed on the next session.
 		// Exception: workflow step beads (*-wfs-*) are always closed — see above.
-		if hookedBead, err := bd.Show(hookedBeadID); err == nil && !beads.IssueStatus(hookedBead.Status).IsTerminal() {
+		//
+		// ESCALATED exits preserve the bead: polecat needs help, bead stays open
+		// for recovery tooling. MR-created exits preserve the bead: refinery will
+		// close after merge.
+		if !shouldCloseHookedBead(mrID, exitType) {
+			if exitType == ExitEscalated {
+				fmt.Fprintf(os.Stderr, "ESCALATED: leaving hooked bead %s open for recovery\n", hookedBeadID)
+			} else {
+				fmt.Fprintf(os.Stderr, "MR %s created: leaving hooked bead %s open for refinery\n", mrID, hookedBeadID)
+			}
+		} else if hookedBead, err := bd.Show(hookedBeadID); err == nil && !beads.IssueStatus(hookedBead.Status).IsTerminal() {
 			// Guard: never close a rig identity bead. Polecats dispatched with the
 			// rig bead as their hook (via mol-polecat-work) must not close permanent
 			// infrastructure. Skip close and fall through to idle state update.
