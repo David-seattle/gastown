@@ -3,6 +3,7 @@ package rig
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -568,10 +569,12 @@ func TestGasTownLocalExcludePatterns_IncludesBeads(t *testing.T) {
 }
 
 func TestEnsureGitignorePatterns_RespectsGlobalGitignore(t *testing.T) {
-	// Mock the global gitignore to contain all required patterns
+	// Mock the global gitignore to contain all required patterns.
+	// Derive from gasTownIgnorePatterns() so this stays correct as upstream
+	// adds patterns (e.g. .opencode/, GEMINI.md added in v1.2.1).
 	orig := readGlobalGitignoreFn
 	readGlobalGitignoreFn = func() string {
-		return ".runtime/\n.claude/\n.logs/\n__pycache__/\nstate.json\nCLAUDE.md\nCLAUDE.local.md\n"
+		return strings.Join(gasTownIgnorePatterns(), "\n") + "\n"
 	}
 	t.Cleanup(func() { readGlobalGitignoreFn = orig })
 
