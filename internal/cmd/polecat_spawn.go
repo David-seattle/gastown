@@ -32,6 +32,7 @@ type SpawnedPolecatInfo struct {
 	Pane        string // Tmux pane ID (empty until StartSession is called)
 	BaseBranch  string // Effective base branch (e.g., "main", "integration/epic-id")
 	Branch      string // Git branch name (for cleanup on rollback)
+	PlanBeadID  string // When set, gt-pregen-plan runs before the agent starts
 
 	// Internal fields for deferred session start
 	account string
@@ -385,6 +386,7 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	startOpts := polecat.SessionStartOptions{
 		RuntimeConfigDir: claudeConfigDir,
 		Agent:            s.agent,
+		PlanBeadID:       s.PlanBeadID,
 	}
 	if err := polecatSessMgr.Start(s.PolecatName, startOpts); err != nil {
 		return "", fmt.Errorf("starting session: %w", err)
@@ -409,8 +411,12 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 	} else {
 		runtimeConfig = config.ResolveRoleAgentConfig("polecat", spawnTownRoot, r.Path)
 	}
-	if err := t.WaitForRuntimeReady(s.SessionName, runtimeConfig, 30*time.Second); err != nil {
-		style.PrintWarning("runtime may not be fully ready: %v", err)
+	// Skip runtime readiness polling during plan pre-generation: only bash
+	// is running (gt-pregen-plan), not the agent. Polling would time out.
+	if s.PlanBeadID == "" {
+		if err := t.WaitForRuntimeReady(s.SessionName, runtimeConfig, 30*time.Second); err != nil {
+			style.PrintWarning("runtime may not be fully ready: %v", err)
+		}
 	}
 
 	// Update agent state with retry logic (gt-94llt7: fail-safe Dolt writes).

@@ -1,0 +1,15 @@
+#!/bin/bash
+# gt-pregen-plan <bead-id>
+# Pre-generates an implementation plan and stores it via ws.
+# Runs in the polecat's tmux pane before Claude starts.
+# Non-fatal: exits 0 even on failure so Claude still launches.
+set -o pipefail
+
+BEAD_ID="$1"
+[ -z "$BEAD_ID" ] && exit 0
+
+PROMPT="Generate an implementation plan for work item $BEAD_ID. Run bd show $BEAD_ID to see the details."
+PLAN_PATH=$(echo "$PROMPT" | "$(dirname "$0")/generate-plan" -) || { echo "[gt-pregen-plan] generate-plan failed" >&2; exit 0; }
+PLAN_NAME=$(ws plan new "$PLAN_PATH") || { echo "[gt-pregen-plan] ws plan new failed" >&2; exit 0; }
+ws plan link "$PLAN_NAME" "$BEAD_ID" || { echo "[gt-pregen-plan] ws plan link failed" >&2; exit 0; }
+echo "[gt-pregen-plan] Plan linked to $BEAD_ID: $PLAN_NAME"
