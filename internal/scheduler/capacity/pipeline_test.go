@@ -218,6 +218,28 @@ func TestReconstructFromContext(t *testing.T) {
 	}
 }
 
+func TestReconstructFromContext_Force(t *testing.T) {
+	ctx := &SlingContextFields{
+		WorkBeadID: "bead-force",
+		TargetRig:  "prod-rig",
+		Force:      true,
+	}
+	params := ReconstructFromContext(ctx)
+	if !params.Force {
+		t.Error("Force: expected true when context has Force=true")
+	}
+
+	ctx2 := &SlingContextFields{
+		WorkBeadID: "bead-noforce",
+		TargetRig:  "prod-rig",
+		Force:      false,
+	}
+	params2 := ReconstructFromContext(ctx2)
+	if params2.Force {
+		t.Error("Force: expected false when context has Force=false")
+	}
+}
+
 func TestReconstructFromContext_EmptyVars(t *testing.T) {
 	ctx := &SlingContextFields{
 		WorkBeadID: "bead-1",

@@ -573,6 +573,7 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		Account:          dp.Account,
 		Agent:            dp.Agent,
 		HookRawBead:      dp.HookRawBead,
+		Force:            dp.Force,
 		Mode:             dp.Mode,
 		FormulaFailFatal: true,
 		CallerContext:    "scheduler-dispatch",
