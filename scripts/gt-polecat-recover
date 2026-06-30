@@ -92,26 +92,34 @@ POLECATS=$(cd /Users/davidtarico/gt && gt polecat list --all --json 2>/dev/null 
 #   $1 = polecat hook issue id (PC_ISSUE)   $2 = expected assignee (rig/polecats/name)
 polecat_is_orphan() {
     local pc_issue="$1" expected="$2"
-    # If this polecat is the assignee of any hooked/in_progress bead, it owns
-    # real work → never an orphan (the agent has claimed via gt prime).
-    local assigned
-    assigned=$(echo "$HOOKED" | jq -r --arg a "$expected" \
-        '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
-    [[ "${assigned:-0}" != "0" ]] && { echo "false"; return; }
-    # Owns no bead. If it also has no hook issue, it's a purposeless alive
-    # polecat → orphan.
-    [[ -z "$pc_issue" ]] && { echo "true"; return; }
-    # It has a hook issue but isn't yet the bead's assignee. Look it up.
+    if [[ -z "$pc_issue" ]]; then
+        # No hook issue. Still not an orphan if it is the assignee of some active
+        # bead (rare); otherwise it is a purposeless alive polecat → orphan.
+        local assigned
+        assigned=$(echo "$HOOKED" | jq -r --arg a "$expected" \
+            '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
+        [[ "${assigned:-0}" != "0" ]] && { echo "false"; return; }
+        echo "true"
+        return
+    fi
+    # Has a hook issue. Re-query it AUTHORITATIVELY with `bd show` rather than the
+    # bulk HOOKED snapshot. The snapshot is built from several bd calls and races
+    # against fresh dispatch (a just-hooked bead is transiently absent), and the
+    # hook is molecule-based so the bead's assignee lags dispatch (the agent sets
+    # assignee only later, via gt prime). Both races previously false-nuked fresh
+    # polecats mid-work. A direct bd show reflects current state.
     local row
-    row=$(echo "$HOOKED" | jq -c --arg id "$pc_issue" \
-        '[.[] | select(.id == $id)] | .[0] // empty' 2>/dev/null)
-    # Hook issue absent (closed/merged/deleted) → orphaned worker.
+    row=$(cd "$GT" && bd show "$pc_issue" --json 2>/dev/null | jq -c '.[0] // empty' 2>/dev/null)
+    # Bead genuinely gone (closed/merged/deleted) → orphaned worker.
     [[ -z "$row" ]] && { echo "true"; return; }
-    local issue_assignee
+    local status issue_assignee
+    status=$(echo "$row" | jq -r '.status // ""' 2>/dev/null)
     issue_assignee=$(echo "$row" | jq -r '.assignee // ""' 2>/dev/null)
-    # Reassigned to a DIFFERENT polecat → superseded → orphan. Empty assignee
-    # (freshly dispatched; agent still in pregen / not yet claimed via gt prime)
-    # → still claiming → NOT orphan.
+    # Bead already closed → work is done; let idle/stale cleanup nuke when the
+    # session actually ends, don't race a finalizing polecat.
+    [[ "$status" == "closed" ]] && { echo "false"; return; }
+    # Live bead reassigned to a DIFFERENT polecat → superseded → orphan. Empty
+    # assignee (fresh dispatch, not yet claimed) or self → legitimate worker.
     if [[ -n "$issue_assignee" && "$issue_assignee" != "$expected" ]]; then
         echo "true"
     else

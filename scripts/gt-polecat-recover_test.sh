@@ -48,6 +48,13 @@ setup() {
 # $1 = JSON to return for "bd list --status=hooked"
 create_bd_mock() {
   local hooked_json="$1"
+  # The dataset served by `bd show <id>` (authoritative single-bead lookup).
+  # Defaults to the hooked dataset; pass a 2nd arg to make `bd show` return a
+  # bead that is ABSENT from the bulk `bd list` snapshot — this simulates the
+  # dispatch race where a just-hooked bead is transiently missing from the
+  # bulk query but is still retrievable directly.
+  local show_json="${2:-$1}"
+  printf '%s' "$show_json" > "$MOCK_DIR/show_data.json"
   cat > "$MOCK_DIR/bd" <<MOCK_EOF
 #!/bin/bash
 # Log all bd invocations for verification
@@ -58,6 +65,12 @@ if [[ "\$1" == "list" ]] && echo "\$@" | grep -q -- "--status=hooked"; then
   cat <<'JSON_EOF'
 ${hooked_json}
 JSON_EOF
+  exit 0
+fi
+
+# bd show <id> --json → authoritative single-bead lookup
+if [[ "\$1" == "show" ]]; then
+  jq -c --arg id "\$2" '[.[] | select(.id == \$id)]' "$MOCK_DIR/show_data.json" 2>/dev/null || echo "[]"
   exit 0
 fi
 
@@ -1047,6 +1060,34 @@ if echo "$OUTPUT" | grep -q "ORPHAN.*rust"; then
   fail "Fresh polecat with unassigned hooked bead should NOT be orphaned" "got: $OUTPUT"
 else
   pass "Fresh polecat with unassigned hooked bead is NOT orphaned"
+fi
+
+# --- Test 35c: Bead missing from bulk snapshot but present via bd show — NOT orphaned ---
+echo "--- Test 35c: Dispatch-race bead (absent from bulk list, present via bd show) is NOT orphaned ---"
+setup
+# The bulk hooked/in_progress/open snapshot is built from several bd calls and
+# races against fresh dispatch: a just-hooked bead can be transiently absent.
+# bd show (authoritative) still returns it as a live, unassigned worker. The
+# orphan check must trust bd show, not the racy bulk snapshot.
+RACEBEAD=$(bead_json "sa-race1" "" "Mid-dispatch race bead" "task" "false")
+# hooked list EMPTY (snapshot missed it); bd show returns it live + unassigned.
+create_bd_mock "[]" "[$RACEBEAD]"
+POLECAT_JSON='[{"rig":"suplari_assistant","name":"rust","state":"working","issue":"sa-race1","session_running":true}]'
+create_gt_mock "$POLECAT_JSON"
+cat > "$MOCK_DIR/tmux" <<'TMUX_EOF'
+#!/bin/bash
+if [[ "$1" == "capture-pane" ]]; then
+  echo "Normal output"
+  exit 0
+fi
+exit 0
+TMUX_EOF
+chmod +x "$MOCK_DIR/tmux"
+OUTPUT=$(run_script)
+if echo "$OUTPUT" | grep -q "ORPHAN.*rust"; then
+  fail "Dispatch-race bead should NOT be orphaned (bd show confirms it is live)" "got: $OUTPUT"
+else
+  pass "Dispatch-race bead (snapshot-missed, show-present) is NOT orphaned"
 fi
 
 # --- Test 36: --fix nukes orphaned polecats ---
