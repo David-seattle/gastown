@@ -1024,6 +1024,31 @@ else
   pass "No orphans when all polecats properly assigned"
 fi
 
+# --- Test 35b: Freshly-dispatched polecat (bead hooked but unassigned) is NOT orphaned ---
+echo "--- Test 35b: Fresh polecat claiming an unassigned hooked bead is NOT orphaned ---"
+setup
+# Bead is hooked and present, but assignee is still empty: the polecat was just
+# dispatched and its agent is in pre-generation, not yet claimed via gt prime.
+BEAD=$(bead_json "sa-fresh1" "" "Fresh dispatch in pregen" "task" "false")
+POLECAT_JSON='[{"rig":"suplari_assistant","name":"rust","state":"working","issue":"sa-fresh1","session_running":true}]'
+create_bd_mock "[$BEAD]"
+create_gt_mock "$POLECAT_JSON"
+cat > "$MOCK_DIR/tmux" <<'TMUX_EOF'
+#!/bin/bash
+if [[ "$1" == "capture-pane" ]]; then
+  echo "Normal output"
+  exit 0
+fi
+exit 0
+TMUX_EOF
+chmod +x "$MOCK_DIR/tmux"
+OUTPUT=$(run_script)
+if echo "$OUTPUT" | grep -q "ORPHAN.*rust"; then
+  fail "Fresh polecat with unassigned hooked bead should NOT be orphaned" "got: $OUTPUT"
+else
+  pass "Fresh polecat with unassigned hooked bead is NOT orphaned"
+fi
+
 # --- Test 36: --fix nukes orphaned polecats ---
 echo "--- Test 36: --fix nukes orphaned polecats ---"
 setup

@@ -79,6 +79,46 @@ fi
 # Fetch live polecats
 POLECATS=$(cd /Users/davidtarico/gt && gt polecat list --all --json 2>/dev/null || echo "[]")
 
+# polecat_is_orphan: decide whether an alive polecat is a genuine orphan that
+# should be nuked. A polecat is an orphan ONLY if it is superseded — i.e. it has
+# no work bead, or its work bead has been reassigned to a DIFFERENT polecat.
+#
+# A freshly-dispatched polecat is alive (its tmux session runs gt-pregen-plan and
+# then the agent) for a long time BEFORE the agent runs `gt prime` and claims the
+# work bead (sets assignee). During that window the polecat's hook issue is set
+# but the work bead's assignee is still empty. The previous check (assignee count
+# == 0 → orphan) nuked these fresh polecats mid-pregen. Treat an unassigned (or
+# self-assigned) hook issue as "claiming/working", not orphan.
+#   $1 = polecat hook issue id (PC_ISSUE)   $2 = expected assignee (rig/polecats/name)
+polecat_is_orphan() {
+    local pc_issue="$1" expected="$2"
+    # If this polecat is the assignee of any hooked/in_progress bead, it owns
+    # real work → never an orphan (the agent has claimed via gt prime).
+    local assigned
+    assigned=$(echo "$HOOKED" | jq -r --arg a "$expected" \
+        '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
+    [[ "${assigned:-0}" != "0" ]] && { echo "false"; return; }
+    # Owns no bead. If it also has no hook issue, it's a purposeless alive
+    # polecat → orphan.
+    [[ -z "$pc_issue" ]] && { echo "true"; return; }
+    # It has a hook issue but isn't yet the bead's assignee. Look it up.
+    local row
+    row=$(echo "$HOOKED" | jq -c --arg id "$pc_issue" \
+        '[.[] | select(.id == $id)] | .[0] // empty' 2>/dev/null)
+    # Hook issue absent (closed/merged/deleted) → orphaned worker.
+    [[ -z "$row" ]] && { echo "true"; return; }
+    local issue_assignee
+    issue_assignee=$(echo "$row" | jq -r '.assignee // ""' 2>/dev/null)
+    # Reassigned to a DIFFERENT polecat → superseded → orphan. Empty assignee
+    # (freshly dispatched; agent still in pregen / not yet claimed via gt prime)
+    # → still claiming → NOT orphan.
+    if [[ -n "$issue_assignee" && "$issue_assignee" != "$expected" ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
 STALE_COUNT=0
 UNKNOWN_COUNT=0
 STALE_IDS=()
@@ -178,10 +218,7 @@ while IFS= read -r polecat; do
     [[ "$PC_SESSION" != "true" ]] && continue
 
     EXPECTED_ASSIGNEE="${PC_RIG}/polecats/${PC_NAME}"
-    ASSIGNED=$(echo "$HOOKED" | jq -r --arg a "$EXPECTED_ASSIGNEE" \
-        '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
-
-    if [[ "$ASSIGNED" == "0" ]]; then
+    if [[ "$(polecat_is_orphan "$PC_ISSUE" "$EXPECTED_ASSIGNEE")" == "true" ]]; then
         ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
         echo "  ORPHAN  ${PC_RIG}/${PC_NAME}  issue=${PC_ISSUE}  state=${PC_STATE}  (no bead assigned)"
     fi
@@ -270,11 +307,10 @@ if [[ "$FIX" == "true" ]]; then
             PC_RIG=$(echo "$polecat" | jq -r '.rig')
             PC_NAME=$(echo "$polecat" | jq -r '.name')
             PC_SESSION=$(echo "$polecat" | jq -r '.session_running')
+            PC_ISSUE=$(echo "$polecat" | jq -r '.issue // ""')
             [[ "$PC_SESSION" != "true" ]] && continue
             EXPECTED_ASSIGNEE="${PC_RIG}/polecats/${PC_NAME}"
-            ASSIGNED=$(echo "$HOOKED" | jq -r --arg a "$EXPECTED_ASSIGNEE" \
-                '[.[] | select(.assignee == $a)] | length' 2>/dev/null)
-            if [[ "$ASSIGNED" == "0" ]]; then
+            if [[ "$(polecat_is_orphan "$PC_ISSUE" "$EXPECTED_ASSIGNEE")" == "true" ]]; then
                 if cd /Users/davidtarico/gt && gt polecat nuke "${PC_RIG}/${PC_NAME}" --force 2>/dev/null; then
                     echo "  NUKED  ${PC_RIG}/${PC_NAME}"
                 else
