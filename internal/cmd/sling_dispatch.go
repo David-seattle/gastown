@@ -407,13 +407,16 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 }
 
 // needsPlan returns true for bead types that benefit from pre-generated plans.
+//
+// TEMPORARILY DISABLED: plan pre-generation defers the polecat's agent session
+// (runs gt-pregen-plan in the pane first). That deferral interacts badly with
+// the dispatch/recover/startup-nudge path in this fork — it skips the startup
+// nudge so the agent starts but is never told to begin work, and it widened an
+// orphan-detection race. The formula's plan step falls back to reading the issue
+// directly, so disabling pregen is safe. Re-enable once the deferred-session
+// path (startup nudge after pregen) is fixed.
 func needsPlan(issueType string) bool {
-	switch issueType {
-	case "feature", "bug", "task":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 // findTownRoot is defined in hook.go

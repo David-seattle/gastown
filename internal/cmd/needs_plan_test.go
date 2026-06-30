@@ -3,13 +3,16 @@ package cmd
 import "testing"
 
 func TestNeedsPlan(t *testing.T) {
+	// Plan pre-generation is temporarily disabled (see needsPlan): the deferred
+	// agent session interacts badly with the dispatch/recover/startup-nudge path.
+	// All bead types currently return false until the deferred-session path is fixed.
 	tests := []struct {
 		issueType string
 		want      bool
 	}{
-		{"feature", true},
-		{"bug", true},
-		{"task", true},
+		{"feature", false},
+		{"bug", false},
+		{"task", false},
 		{"chore", false},
 		{"epic", false},
 		{"decision", false},
