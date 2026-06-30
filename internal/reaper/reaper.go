@@ -203,7 +203,7 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 	joinClause = `LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'in_progress'))
 	) open_parent ON open_parent.issue_id = w.id`
@@ -221,11 +221,52 @@ func HasReaperSchema(db *sql.DB) (bool, error) {
 
 	var count int
 	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('wisps', 'issues') AND table_schema = DATABASE()").Scan(&count)
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('wisps', 'issues', 'wisp_dependencies') AND table_schema = DATABASE()").Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("check reaper schema: %w", err)
 	}
-	return count >= 2, nil
+	if count < 3 {
+		return false, nil
+	}
+
+	// The central Dolt server hosts databases with mixed schemas — some have the
+	// migrated typed dependency columns, some still carry the legacy depends_on_id.
+	// The reaper's queries reference the migrated columns, so skip any database
+	// whose dependency tables haven't been migrated rather than erroring on it.
+	hasWispDependencyColumns, err := hasColumns(ctx, db, "wisp_dependencies", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external")
+	if err != nil || !hasWispDependencyColumns {
+		return hasWispDependencyColumns, err
+	}
+	dependenciesExists, err := tableExists(ctx, db, "dependencies")
+	if err != nil || !dependenciesExists {
+		return !dependenciesExists, err
+	}
+	return hasColumns(ctx, db, "dependencies", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external")
+}
+
+// tableExists reports whether the named table exists in the current database.
+func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()", table).Scan(&count)
+	return count > 0, err
+}
+
+// hasColumns reports whether the named table has all of the given columns.
+func hasColumns(ctx context.Context, db *sql.DB, table string, columns ...string) (bool, error) {
+	if len(columns) == 0 {
+		return true, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(columns)), ",")
+	args := make([]interface{}, 0, len(columns)+1)
+	args = append(args, table)
+	for _, column := range columns {
+		args = append(args, column)
+	}
+	var count int
+	query := fmt.Sprintf("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name IN (%s)", placeholders)
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count == len(columns), err
 }
 
 // Scan counts reaper candidates in a database without modifying anything.
@@ -278,13 +319,14 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type != 'epic'
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
-			INNER JOIN issues dep ON d.depends_on_id = dep.id
+			INNER JOIN issues dep ON d.depends_on_issue_id = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM dependencies d
+			SELECT DISTINCT d.depends_on_issue_id FROM dependencies d
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
+			AND d.depends_on_issue_id IS NOT NULL
 		)`
 	if err := db.QueryRowContext(ctx, staleQuery, now.Add(-staleIssueAge)).Scan(&result.StaleCandidates); err != nil {
 		if !isTableNotFound(err) {
@@ -302,8 +344,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Anomaly detection: dangling parent references.
 	danglingQuery := `
 		SELECT COUNT(*) FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
-		WHERE wd.type = 'parent-child' AND pw.id IS NULL AND pi.id IS NULL`
+		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
+		WHERE wd.type = 'parent-child' AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL) AND pw.id IS NULL AND pi.id IS NULL`
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
 		result.Anomalies = append(result.Anomalies, Anomaly{
@@ -604,13 +646,14 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
-			INNER JOIN `+"`%s`"+`.issues dep ON d.depends_on_id = dep.id
+			INNER JOIN `+"`%s`"+`.issues dep ON d.depends_on_issue_id = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM `+"`%s`"+`.dependencies d
+			SELECT DISTINCT d.depends_on_issue_id FROM `+"`%s`"+`.dependencies d
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
+			AND d.depends_on_issue_id IS NOT NULL
 		)`, dbName, dbName, dbName, dbName, dbName)
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
@@ -746,10 +789,23 @@ func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg 
 			}
 		}
 
-		// Clean up reverse dependency references to prevent dangling parent refs.
-		delReverse := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN %s", inClause)
-		if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
-			// Non-fatal.
+		// Clean up typed reverse dependency references to prevent dangling parent refs.
+		var reverseDeletes []string
+		switch primaryTable {
+		case "wisps":
+			reverseDeletes = []string{
+				fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_wisp_id IN %s", inClause),
+			}
+		case "issues":
+			reverseDeletes = []string{
+				fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_issue_id IN %s", inClause),
+				fmt.Sprintf("DELETE FROM dependencies WHERE depends_on_issue_id IN %s", inClause),
+			}
+		}
+		for _, delReverse := range reverseDeletes {
+			if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
+				// Non-fatal.
+			}
 		}
 
 		delPrimary := fmt.Sprintf("DELETE FROM `%s` WHERE id IN %s", primaryTable, inClause) //nolint:gosec // G201: primaryTable is internal

@@ -257,7 +257,7 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 
 	// Copy dependencies
 	if err := bdSQL(workDir,
-		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, CASE WHEN target_wisp.id IS NULL THEN d.depends_on_issue_id ELSE NULL END, CASE WHEN target_wisp.id IS NOT NULL THEN d.depends_on_issue_id ELSE d.depends_on_wisp_id END, d.depends_on_external, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id LEFT JOIN wisps target_wisp ON target_wisp.id = d.depends_on_issue_id"); err != nil {
 		if !strings.Contains(err.Error(), "nothing") {
 			return fmt.Errorf("copying dependencies: %w", err)
 		}
@@ -457,16 +457,34 @@ var wispAuxTableDDLs = []wispAuxTableDDL{
 	},
 	{
 		name: "wisp_dependencies",
+		// Migrated schema: the single depends_on_id column was split into typed
+		// target columns (issue / wisp / external), matching beads v1.0.5.
 		ddl: `CREATE TABLE wisp_dependencies (
+  id char(36) NOT NULL DEFAULT (uuid()),
   issue_id varchar(255) NOT NULL,
-  depends_on_id varchar(255) NOT NULL,
   type varchar(32) NOT NULL DEFAULT 'blocks',
-  created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  created_by varchar(255) NOT NULL DEFAULT '',
-  metadata json,
+  created_at datetime DEFAULT CURRENT_TIMESTAMP,
+  created_by varchar(255) DEFAULT '',
+  metadata json DEFAULT (json_object()),
   thread_id varchar(255) DEFAULT '',
-  PRIMARY KEY (issue_id, depends_on_id),
-  KEY idx_wisp_deps_depends_on (depends_on_id)
+  depends_on_issue_id varchar(255),
+  depends_on_wisp_id varchar(255),
+  depends_on_external varchar(255),
+  PRIMARY KEY (id),
+  KEY idx_wisp_dep_external_target (depends_on_external),
+  KEY idx_wisp_dep_issue_target (depends_on_issue_id),
+  KEY idx_wisp_dep_type (type),
+  KEY idx_wisp_dep_type_external (type, depends_on_external),
+  KEY idx_wisp_dep_type_issue (type, depends_on_issue_id),
+  KEY idx_wisp_dep_type_wisp (type, depends_on_wisp_id),
+  KEY idx_wisp_dep_wisp_target (depends_on_wisp_id),
+  UNIQUE KEY uk_wisp_dep_external_target (issue_id, depends_on_external),
+  UNIQUE KEY uk_wisp_dep_issue_target (issue_id, depends_on_issue_id),
+  UNIQUE KEY uk_wisp_dep_wisp_target (issue_id, depends_on_wisp_id),
+  CONSTRAINT fk_wisp_dep_issue FOREIGN KEY (issue_id) REFERENCES wisps (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_wisp_dep_issue_target FOREIGN KEY (depends_on_issue_id) REFERENCES issues (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_wisp_dep_wisp_target FOREIGN KEY (depends_on_wisp_id) REFERENCES wisps (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT ck_wisp_dep_one_target CHECK (((NOT(depends_on_issue_id IS NULL)) + (NOT(depends_on_wisp_id IS NULL)) + (NOT(depends_on_external IS NULL))) = 1)
 )`,
 	},
 }
