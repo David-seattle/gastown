@@ -41,6 +41,35 @@ drain_close() {
     return 1
 }
 
+# close_merged_source closes a work bead whose MR has ALREADY been merged into the
+# target branch. Callers must only invoke this after confirming the merge — the
+# landed commit is definitive proof the work is complete, so a refused close must
+# not leave the bead stuck open/hooked forever. bd refuses to close a bead whose
+# attached work molecule (mol-polecat-work) is still open, which happens whenever
+# the polecat stalls or dies mid `gt done` (it created/pushed the MR but never
+# closed its molecule). Try a clean close first; on refusal, log the reason and
+# force-close. Never silent — a swallowed failure here is exactly what left merged
+# beads hooked (a re-dispatch hazard).
+close_merged_source() {
+    local bead_id="$1" reason="$2"
+    local err_file
+    err_file=$(mktemp)
+    if bd close "$bead_id" -r "$reason" 2>"$err_file"; then
+        rm -f "$err_file"
+        return 0
+    fi
+    local close_err
+    close_err=$(cat "$err_file" 2>/dev/null)
+    rm -f "$err_file"
+    log "WARNING: bd close $bead_id refused after merge ($close_err); merge is authoritative, force-closing"
+    if bd close "$bead_id" -r "$reason (forced: merged)" --force 2>/dev/null; then
+        log "$bead_id: force-closed after merge"
+        return 0
+    fi
+    log "ERROR: bd close $bead_id failed even with --force after merge"
+    return 1
+}
+
 # Close ALL open MR beads that reference the same branch.
 # Prevents duplicate MR beads from keeping the loop alive.
 close_all_mrs_for_branch() {
@@ -262,7 +291,7 @@ process_mr() {
         log "$mr_id: already merged, closing"
         bd close "$mr_id" -r "already merged" 2>/dev/null || true
         if [[ -n "$source_issue" ]]; then
-            bd close "$source_issue" -r "Merged via $mr_id" 2>/dev/null || true
+            close_merged_source "$source_issue" "Merged via $mr_id" || true
         fi
         git push origin --delete "$branch" 2>/dev/null || true
         return 0
@@ -289,7 +318,7 @@ process_mr() {
             log "$mr_id: merged successfully"
             bd close "$mr_id" -r "merged" 2>/dev/null || true
             if [[ -n "$source_issue" ]]; then
-                bd close "$source_issue" -r "Merged via $mr_id" 2>/dev/null || true
+                close_merged_source "$source_issue" "Merged via $mr_id" || true
             fi
             git push origin --delete "$branch" 2>/dev/null || true
         else

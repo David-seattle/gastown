@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DRAIN_SCRIPT="$SCRIPT_DIR/gt-refinery-drain"
+DRAIN_SCRIPT="${DRAIN_SCRIPT:-$SCRIPT_DIR/gt-refinery-drain}"
 PASS=0
 FAIL=0
 TEST_TMPDIR=""
@@ -312,6 +312,63 @@ if echo "$output" | grep -q "already merged"; then
   fail "Should do actual rebase merge, not detect as already merged"
 else
   pass "Commit merged via rebase path (not already-merged shortcut)"
+fi
+
+# ── Test 7b: Source close refused (open molecule) is force-closed after merge ──
+echo "--- Test 7b: Merged source bead whose normal close is refused gets force-closed ---"
+setup
+add_rig_with_refinery "backend" "ba-"
+
+# Feature branch with new commits on the remote (clean merge path)
+refinery="$TEST_TMPDIR/gt/backend/refinery/rig"
+cd "$refinery"
+git checkout -b polecat/blocked-work >/dev/null 2>&1
+echo "blocked work" >> file.txt
+git add file.txt
+git commit -m "blocked work" >/dev/null 2>&1
+git push origin polecat/blocked-work >/dev/null 2>&1
+git checkout main >/dev/null 2>&1
+cd /tmp
+
+# bd mock: source bead ba-7b01's NORMAL close is refused (open molecule); it
+# succeeds only with --force. MR bead closes normally. Mirrors the real failure
+# where a stalled polecat left its work molecule open, blocking bd close.
+cat > "$MOCK_DIR/bd" << MOCK
+#!/bin/bash
+if [[ "\${1:-}" == "list" ]]; then
+  echo '[{"id":"ba-mr7b","dependency_count":0}]'
+elif [[ "\${1:-}" == "show" ]]; then
+  echo '{"id":"ba-mr7b","description":"branch: polecat/blocked-work\ntarget: main\nsource_issue: ba-7b01"}'
+elif [[ "\${1:-}" == "close" ]]; then
+  echo "CLOSED:\$*" >> "$MOCK_DIR/bd_calls.log"
+  if echo "\$*" | grep -q "ba-7b01" && ! echo "\$*" | grep -q -- "--force"; then
+    echo "cannot close ba-7b01: blocked by open issues [ba-wisp-x] (use --force to override)" >&2
+    exit 1
+  fi
+  exit 0
+else
+  exit 0
+fi
+MOCK
+chmod +x "$MOCK_DIR/bd"
+> "$MOCK_DIR/bd_calls.log"
+
+output=$(run_drain)
+if echo "$output" | grep -q "merged successfully"; then
+  pass "7b: merge reached the source-close path"
+else
+  fail "7b: should report merged successfully (got: $output)"
+fi
+# The fix must escalate to --force and log it, not swallow the refusal.
+if grep -qE "close.*ba-7b01.*--force|close.*--force.*ba-7b01" "$MOCK_DIR/bd_calls.log" 2>/dev/null; then
+  pass "7b: refused source close escalated to --force after merge"
+else
+  fail "7b: source close should escalate to --force (calls: $(cat "$MOCK_DIR/bd_calls.log" 2>/dev/null))"
+fi
+if echo "$output" | grep -qiE "force-clos"; then
+  pass "7b: force-close logged loudly (not swallowed)"
+else
+  fail "7b: force-close should be logged (got: $output)"
 fi
 
 # ── Test 8: Rebase needed (branch diverged) ─────────────────────────────────
